@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { 
   Upload, 
   Image as ImageIcon, 
@@ -14,7 +14,9 @@ import {
   X,
   Layers,
   ChevronRight,
-  ChevronLeft
+  ChevronLeft,
+  Undo,
+  Redo
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { removeBackground } from '@imgly/background-removal';
@@ -50,6 +52,53 @@ export default function App() {
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [precisionMode, setPrecisionMode] = useState<'standard' | 'pro'>('standard');
+  const [showPortraitBlur, setShowPortraitBlur] = useState(false);
+  const [isRefining, setIsRefining] = useState(false);
+  const [undoStack, setUndoStack] = useState<BatchItem[][]>([]);
+  const [redoStack, setRedoStack] = useState<BatchItem[][]>([]);
+
+  const pushToUndo = useCallback((items: BatchItem[]) => {
+    setUndoStack(prev => [...prev, JSON.parse(JSON.stringify(items))].slice(-20));
+    setRedoStack([]);
+  }, []);
+
+  const undo = useCallback(() => {
+    if (undoStack.length === 0) return;
+    const previous = undoStack[undoStack.length - 1];
+    const current = JSON.parse(JSON.stringify(batchItems));
+    setRedoStack(prev => [...prev, current]);
+    setUndoStack(prev => prev.slice(0, -1));
+    setBatchItems(previous);
+  }, [undoStack, batchItems]);
+
+  const redo = useCallback(() => {
+    if (redoStack.length === 0) return;
+    const next = redoStack[redoStack.length - 1];
+    const current = JSON.parse(JSON.stringify(batchItems));
+    setUndoStack(prev => [...prev, current]);
+    setRedoStack(prev => prev.slice(0, -1));
+    setBatchItems(next);
+  }, [redoStack, batchItems]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        if (e.key.toLowerCase() === 'z') {
+          e.preventDefault();
+          if (e.shiftKey) {
+            redo();
+          } else {
+            undo();
+          }
+        } else if (e.key.toLowerCase() === 'y') {
+          e.preventDefault();
+          redo();
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [undo, redo]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -101,6 +150,7 @@ export default function App() {
           });
           count++;
           if (count === files.length) {
+            pushToUndo(batchItems);
             setBatchItems(prev => [...prev, ...newItems]);
             setError(null);
             if (newItems.length > 0 && !aiInsight) {
@@ -137,6 +187,7 @@ export default function App() {
   const removeBatchBg = async () => {
     if (batchItems.length === 0 || isProcessing) return;
 
+    pushToUndo(batchItems);
     setIsProcessing(true);
     const updatedItems = [...batchItems];
 
@@ -200,7 +251,16 @@ export default function App() {
     link.click();
   };
 
+  const downloadCurrent = () => {
+    if (!currentItem || !currentItem.processed) return;
+    const link = document.createElement('a');
+    link.href = currentItem.processed;
+    link.download = `cleared_${currentItem.name.split('.')[0]}.png`;
+    link.click();
+  };
+
   const reset = () => {
+    pushToUndo(batchItems);
     setBatchItems([]);
     setError(null);
     setAiInsight(null);
@@ -208,6 +268,50 @@ export default function App() {
   };
 
   const currentItem = batchItems[currentIndex];
+
+  const refineEdges = async () => {
+    if (!currentItem || !currentItem.processed || isRefining) return;
+
+    pushToUndo(batchItems);
+    setIsRefining(true);
+    try {
+      // We simulate AI edge refinement by using a small morphological erosion/dilation or high-pass filter 
+      // via a canvas. For a true "AI" experience, we could send it to Gemini, but since it's an image processing 
+      // task on the result, we'll implement a technical refinement filter.
+      
+      const img = new Image();
+      img.src = currentItem.processed;
+      await new Promise((resolve) => (img.onload = resolve));
+
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      canvas.width = img.width;
+      canvas.height = img.height;
+      ctx.drawImage(img, 0, 0);
+
+      // Simple AI Refinement: Feathering and edge smoothing
+      // In a real app, this would be a more complex GPGPU shader or AI model call.
+      // We'll apply a slight alpha smoothing to soften harsh segmentation edges.
+      ctx.globalCompositeOperation = 'destination-in';
+      ctx.filter = 'blur(0.5px)'; // Subtle edge softening
+      ctx.drawImage(canvas, 0, 0);
+      
+      const refinedUrl = canvas.toDataURL('image/png');
+      const updatedItems = [...batchItems];
+      updatedItems[currentIndex].processed = refinedUrl;
+      setBatchItems(updatedItems);
+      
+      // Update history
+      saveToHistory(currentItem.original, refinedUrl);
+    } catch (e) {
+      console.error("Refinement failed", e);
+      setError("AI Refinement failed to initialize.");
+    } finally {
+      setIsRefining(false);
+    }
+  };
 
   return (
     <div className="min-h-screen bg-[#0A0A0A] text-[#E5E7EB] font-sans selection:bg-blue-600 selection:text-white">
@@ -217,12 +321,30 @@ export default function App() {
           <div className="w-8 h-8 bg-blue-600 rounded flex items-center justify-center">
             <Sparkles className="w-5 h-5 text-white" />
           </div>
-          <h1 className="font-bold text-xl tracking-tight">VisionClear <span className="text-blue-500">AI</span></h1>
+          <h1 className="font-bold text-xl tracking-tight">zyntix <span className="text-blue-500">bg removal</span></h1>
         </div>
         <div className="flex items-center gap-4">
           <div className="hidden sm:flex bg-[#1A1A1A] rounded-full px-3 py-1 text-[10px] uppercase tracking-wider text-gray-400 gap-2 border border-[#262626]">
             <span className="w-1.5 h-1.5 rounded-full bg-green-500 my-auto animate-pulse"></span>
             AI Engine: Core-X8
+          </div>
+          <div className="flex bg-[#1A1A1A] rounded-xl border border-[#262626] p-1 gap-1">
+            <button 
+              onClick={undo}
+              disabled={undoStack.length === 0}
+              className="p-1.5 hover:bg-[#262626] rounded-lg transition-colors text-gray-500 hover:text-white disabled:opacity-20"
+              title="Undo (Ctrl+Z)"
+            >
+              <Undo className="w-4 h-4" />
+            </button>
+            <button 
+              onClick={redo}
+              disabled={redoStack.length === 0}
+              className="p-1.5 hover:bg-[#262626] rounded-lg transition-colors text-gray-500 hover:text-white disabled:opacity-20"
+              title="Redo (Ctrl+Y)"
+            >
+              <Redo className="w-4 h-4" />
+            </button>
           </div>
           <button 
             onClick={() => setShowHistory(true)}
@@ -309,16 +431,37 @@ export default function App() {
                             />
                           ) : (
                             <div className="w-full h-full relative">
-                              <div className="absolute inset-0" style={{ backgroundColor: '#1a1a1a', backgroundImage: 'linear-gradient(45deg, #222 25%, transparent 25%), linear-gradient(-45deg, #222 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #222 75%), linear-gradient(-45deg, transparent 75%, #222 75%)', backgroundSize: '20px 20px', backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0px' }}></div>
+                              {showPortraitBlur ? (
+                                <img 
+                                  src={currentItem.original} 
+                                  alt="Blurred Background" 
+                                  className="w-full h-full object-contain blur-[12px] opacity-60 scale-105 transition-all"
+                                />
+                              ) : (
+                                <div className="absolute inset-0" style={{ backgroundColor: '#1a1a1a', backgroundImage: 'linear-gradient(45deg, #222 25%, transparent 25%), linear-gradient(-45deg, #222 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #222 75%), linear-gradient(-45deg, transparent 75%, #222 75%)', backgroundSize: '20px 20px', backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0px' }}></div>
+                              )}
                               <img 
                                 src={currentItem.processed} 
                                 alt="Processed" 
-                                className="w-full h-full object-contain relative z-10"
+                                className="w-full h-full object-contain absolute inset-0 z-10"
                               />
                             </div>
                           )}
                         </motion.div>
                       </AnimatePresence>
+
+                      {/* Floating Download Button (Overlay) */}
+                      {currentItem.processed && (
+                        <motion.button
+                          initial={{ opacity: 0, y: 10 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          onClick={(e) => { e.stopPropagation(); downloadCurrent(); }}
+                          className="absolute bottom-4 right-4 z-40 p-3 rounded-full bg-blue-600 text-white shadow-lg hover:bg-blue-700 active:scale-95 transition-all flex items-center justify-center gap-2 group/btn"
+                        >
+                          <Download className="w-5 h-5" />
+                          <span className="max-w-0 overflow-hidden group-hover/btn:max-w-xs transition-all duration-300 whitespace-nowrap text-xs font-bold">Download</span>
+                        </motion.button>
+                      )}
 
                       {/* Navigation Controls */}
                       <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 flex justify-between px-4 opacity-0 group-hover:opacity-100 transition-opacity z-30">
@@ -338,7 +481,7 @@ export default function App() {
 
                       {/* Progress Overlay */}
                       {currentItem.status === 'processing' && (
-                        <div className="absolute inset-0 bg-black/80 backdrop-blur-sm flex flex-col items-center justify-center p-8 text-center z-20">
+                        <div className="absolute inset-0 bg-black/40 backdrop-blur-[2px] flex flex-col items-center justify-center p-8 text-center z-20">
                           <Loader2 className="w-12 h-12 text-blue-500 animate-spin mb-4" />
                           <h3 className="font-bold text-xl mb-2 text-[#E5E7EB]">Processing Item {currentIndex + 1}/{batchItems.length}</h3>
                           <div className="w-full max-w-xs h-1 bg-[#262626] rounded-full overflow-hidden">
@@ -372,37 +515,70 @@ export default function App() {
 
                 {/* Batch Actions */}
                 <div className="flex flex-col gap-3">
-                  {batchItems.some(item => item.status !== 'done') && (
+                  {isProcessing ? (
                     <button
-                      onClick={removeBatchBg}
-                      disabled={isProcessing}
-                      className="w-full py-4 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 font-medium text-sm flex items-center justify-center gap-2 transition-all active:scale-[0.98] text-white"
+                      disabled
+                      className="w-full py-4 rounded-xl bg-blue-600/50 cursor-wait font-medium text-sm flex items-center justify-center gap-2 transition-all text-white"
                     >
-                      {isProcessing ? (
-                        <>
-                          <Loader2 className="w-5 h-5 animate-spin" />
-                          Processing Batch... ({batchItems.filter(i => i.status === 'done').length}/{batchItems.length})
-                        </>
+                      <Loader2 className="w-5 h-5 animate-spin" />
+                      Processing... {batchItems.filter(i => i.status === 'done').length}/{batchItems.length}
+                    </button>
+                  ) : (
+                    <>
+                      {currentItem?.status === 'done' ? (
+                        <button
+                          onClick={downloadCurrent}
+                          className="w-full py-4 rounded-xl bg-blue-600 hover:bg-blue-700 font-bold text-sm flex items-center justify-center gap-2 transition-all active:scale-[0.98] text-white shadow-[0_0_25px_rgba(37,99,235,0.4)]"
+                        >
+                          <Download className="w-5 h-5" />
+                          Download result
+                        </button>
                       ) : (
-                        <>
+                        <button
+                          onClick={removeBatchBg}
+                          className="w-full py-4 rounded-xl bg-blue-600 hover:bg-blue-700 font-bold text-sm flex items-center justify-center gap-2 transition-all active:scale-[0.98] text-white"
+                        >
                           <Sparkles className="w-4 h-4" />
-                          Process {batchItems.filter(i => i.status !== 'done').length} Items
-                        </>
+                          Clear focus Background
+                        </button>
                       )}
-                    </button>
-                  )}
-                  
-                  {batchItems.some(item => item.status === 'done') && (
-                    <button
-                      onClick={downloadAll}
-                      className="w-full py-4 rounded-xl bg-white text-black hover:bg-gray-100 font-bold text-sm flex items-center justify-center gap-2 transition-all active:scale-[0.98]"
-                    >
-                      <Download className="w-5 h-5" />
-                      Download {batchItems.filter(item => item.status === 'done').length} Processed Items (ZIP)
-                    </button>
+
+                      {batchItems.some(item => item.status === 'done') && batchItems.length > 1 && (
+                        <button
+                          onClick={downloadAll}
+                          className="w-full py-4 rounded-xl bg-white/10 text-white border border-white/10 hover:bg-white/20 font-medium text-sm flex items-center justify-center gap-2 transition-all active:scale-[0.98]"
+                        >
+                          <Layers className="w-4 h-4" />
+                          Export selected ({batchItems.filter(item => item.status === 'done').length}) as ZIP
+                        </button>
+                      )}
+                    </>
                   )}
                   
                   <div className="grid grid-cols-2 gap-3">
+                    {currentItem?.status === 'done' && (
+                      <div className="col-span-2 grid grid-cols-2 gap-3">
+                        <button
+                          onClick={() => setShowPortraitBlur(!showPortraitBlur)}
+                          className={`py-4 rounded-xl border text-[11px] uppercase tracking-wider font-semibold transition-all flex items-center justify-center gap-2 ${showPortraitBlur ? 'bg-blue-600/20 border-blue-500 text-blue-400' : 'bg-[#1A1A1A] border-[#262626] text-gray-500 hover:text-white'}`}
+                        >
+                          <Sparkles className="w-4 h-4" />
+                          {showPortraitBlur ? 'Transparency' : 'Portrait'}
+                        </button>
+                        <button
+                          onClick={refineEdges}
+                          disabled={isRefining}
+                          className={`py-4 rounded-xl border text-[11px] uppercase tracking-wider font-semibold transition-all flex items-center justify-center gap-2 bg-[#1A1A1A] border-[#262626] text-gray-500 hover:text-white disabled:opacity-50`}
+                        >
+                          {isRefining ? (
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                          ) : (
+                            <Layers className="w-4 h-4" />
+                          )}
+                          {isRefining ? 'Refining...' : 'AI Refine'}
+                        </button>
+                      </div>
+                    )}
                     <button
                       onClick={reset}
                       className="py-4 rounded-xl bg-[#1A1A1A] hover:bg-[#262626] border border-[#262626] text-[11px] uppercase tracking-wider font-semibold text-gray-500 hover:text-white transition-all flex items-center justify-center gap-2"
@@ -433,10 +609,13 @@ export default function App() {
                 <div 
                   key={item.id}
                   onClick={() => setCurrentIndex(idx)}
-                  className={`p-2 rounded-xl border transition-all cursor-pointer flex items-center gap-3 ${currentIndex === idx ? 'bg-blue-600/10 border-blue-500/50' : 'bg-[#1A1A1A] border-[#262626] hover:border-gray-700'}`}
+                  className={`p-2 rounded-xl border transition-all cursor-pointer flex items-center gap-3 relative overflow-hidden ${currentIndex === idx ? 'bg-blue-600/10 border-blue-500/50' : 'bg-[#1A1A1A] border-[#262626] hover:border-gray-700'}`}
                 >
-                  <div className="w-12 h-12 rounded-lg bg-[#0A0A0A] overflow-hidden shrink-0">
-                    <img src={item.processed || item.original} alt="" className="w-full h-full object-cover" />
+                  <div className="w-12 h-12 rounded-lg bg-[#0A0A0A] overflow-hidden shrink-0 relative">
+                    {item.processed && currentIndex !== idx && (
+                      <img src={item.original} alt="" className="absolute inset-0 w-full h-full object-cover blur-[2px] opacity-30" />
+                    )}
+                    <img src={item.processed || item.original} alt="" className="w-full h-full object-cover relative z-10" />
                   </div>
                   <div className="flex-1 min-w-0">
                     <p className="text-[11px] font-medium truncate">{item.name}</p>
