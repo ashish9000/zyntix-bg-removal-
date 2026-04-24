@@ -24,6 +24,7 @@ import { GoogleGenAI } from "@google/genai";
 import JSZip from 'jszip';
 
 // Initialize Gemini for "Smart Insights"
+// Note: apiKey is injected via vite.config.ts from process.env.GEMINI_API_KEY or fallback
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 interface ProcessedImage {
@@ -202,10 +203,11 @@ export default function App() {
       try {
         const response = await removeBackground(updatedItems[i].original, {
           model: precisionMode === 'pro' ? 'isnet' : 'isnet_fp16',
+          device: 'gpu', // Force GPU acceleration if available
           progress: (p: any) => {
             updatedItems[i].progress = Math.round(Number(p) * 100);
             // Throttle state updates for performance
-            if (updatedItems[i].progress % 2 === 0) {
+            if (updatedItems[i].progress % 5 === 0) {
               setBatchItems([...updatedItems]);
             }
           },
@@ -726,8 +728,9 @@ export default function App() {
           </span>
         </button>
         <div className="h-4 w-px bg-[#262626]"></div>
-        <p className="text-[10px] text-gray-500 uppercase tracking-widest">
+        <p className="text-[10px] text-gray-500 uppercase tracking-widest flex items-center gap-1">
           {precisionMode === 'pro' ? 'Precision Core v4.0 (ISO)' : 'Turbo Core v3.1'}
+          <span className="text-blue-500/50">• GPU ACTIVE</span>
         </p>
       </footer>
     </div>

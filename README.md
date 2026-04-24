@@ -1,20 +1,21 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# zyntix bg removal 🚀
 
-# Run and deploy your AI Studio app
+Professional background removal using advanced on-device AI technology.
 
-This contains everything you need to run your app locally.
+## Features
+- **Instant Background Removal**: High-precision AI processing directly in your browser.
+- **Batch Processing**: Upload and process multiple images at once.
+- **AI Edge Refinement**: Polish edges for a professional look.
+- **Portrait Mode**: Add cinematic depth-of-field blur to your results.
+- **PWA Support**: Install it on your mobile device or desktop.
+- **Elegant Dark Theme**: A high-contrast, modern UI.
 
-View your app in AI Studio: https://ai.studio/apps/0c2a516f-974f-4393-a039-3e5337e69490
+## How to Run Locally
 
-## Run Locally
+1. Clone the repository.
+2. Install dependencies: `npm install`
+3. Start the development server: `npm run dev`
+4. Build for production: `npm run build`
 
-**Prerequisites:**  Node.js
-
-
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+## Deployment
+This project is configured for automatic deployment to **GitHub Pages** via GitHub Actions.
