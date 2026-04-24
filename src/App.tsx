@@ -16,7 +16,8 @@ import {
   ChevronRight,
   ChevronLeft,
   Undo,
-  Redo
+  Redo,
+  Eraser
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { removeBackground } from '@imgly/background-removal';
@@ -41,11 +42,23 @@ interface BatchItem {
   processed: string | null;
   status: 'pending' | 'processing' | 'done' | 'error';
   progress: number;
+  status_label?: string;
 }
 
 export default function App() {
   const [batchItems, setBatchItems] = useState<BatchItem[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [gpuEnabled, setGpuEnabled] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    try {
+      const canvas = document.createElement('canvas');
+      const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+      setGpuEnabled(!!gl);
+    } catch {
+      setGpuEnabled(false);
+    }
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<ProcessedImage[]>([]);
   const [showHistory, setShowHistory] = useState(false);
@@ -55,6 +68,7 @@ export default function App() {
   const [precisionMode, setPrecisionMode] = useState<'standard' | 'pro'>('standard');
   const [useDeepScan, setUseDeepScan] = useState(false);
   const [showPortraitBlur, setShowPortraitBlur] = useState(false);
+  const [showMask, setShowMask] = useState(false);
   const [isRefining, setIsRefining] = useState(false);
   const [undoStack, setUndoStack] = useState<BatchItem[][]>([]);
   const [redoStack, setRedoStack] = useState<BatchItem[][]>([]);
@@ -116,15 +130,27 @@ export default function App() {
   }, []);
 
   const saveToHistory = (original: string, processed: string) => {
+    // Limit history to 5 items to prevent Storage Quota issues
     const newItem: ProcessedImage = {
       id: Date.now().toString(),
       original,
       processed,
       timestamp: Date.now(),
     };
-    const updatedHistory = [newItem, ...history].slice(0, 10);
+    const updatedHistory = [newItem, ...history].slice(0, 5);
     setHistory(updatedHistory);
-    localStorage.setItem('background_removal_history', JSON.stringify(updatedHistory));
+    
+    try {
+      localStorage.setItem('background_removal_history', JSON.stringify(updatedHistory));
+    } catch (e) {
+      console.warn('LocalStorage quota exceeded, reducing history persistence');
+      // If quota exceeded, try saving only the 2 most recent items
+      try {
+        localStorage.setItem('background_removal_history', JSON.stringify(updatedHistory.slice(0, 2)));
+      } catch (innerE) {
+        localStorage.removeItem('background_removal_history');
+      }
+    }
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -186,6 +212,157 @@ export default function App() {
     }
   };
 
+  const currentItem = batchItems[currentIndex];
+
+  const [isBrushMode, setIsBrushMode] = useState(false);
+  const [brushSize, setBrushSize] = useState(30);
+  const [brushHardness, setBrushHardness] = useState(0.5);
+  const [brushOpacity, setBrushOpacity] = useState(1.0);
+  const [brushType, setBrushType] = useState<'restore' | 'erase'>('restore');
+  const [originalImageElement, setOriginalImageElement] = useState<HTMLImageElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [isDrawing, setIsDrawing] = useState(false);
+
+  // Pre-load original image for smooth brush performance
+  useEffect(() => {
+    if (isBrushMode && currentItem?.original) {
+      const img = new Image();
+      img.src = currentItem.original;
+      img.onload = () => setOriginalImageElement(img);
+    } else {
+      setOriginalImageElement(null);
+    }
+  }, [isBrushMode, currentItem?.original]);
+
+  const startDrawing = (e: React.MouseEvent | React.TouchEvent) => {
+    if (!isBrushMode || !canvasRef.current) return;
+    setIsDrawing(true);
+    draw(e);
+  };
+
+  const stopDrawing = () => {
+    if (isDrawing) {
+      setIsDrawing(false);
+      // Save state to history after brush stroke
+      if (currentItem && canvasRef.current) {
+        const url = canvasRef.current.toDataURL('image/png', 1.0);
+        const updatedItems = [...batchItems];
+        updatedItems[currentIndex].processed = url;
+        setBatchItems(updatedItems);
+        saveToHistory(currentItem.original, url);
+      }
+    }
+  };
+
+  const draw = (e: React.MouseEvent | React.TouchEvent) => {
+    if (!isDrawing || !canvasRef.current || !currentItem || !originalImageElement) return;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const x = ('touches' in e ? (e as React.TouchEvent).touches[0].clientX : (e as React.MouseEvent).clientX) - rect.left;
+    const y = ('touches' in e ? (e as React.TouchEvent).touches[0].clientY : (e as React.MouseEvent).clientY) - rect.top;
+
+    // Use a safety margin for scale to avoid 0 division
+    const scaleX = canvas.width / (rect.width || 1);
+    const scaleY = canvas.height / (rect.height || 1);
+    const realX = x * scaleX;
+    const realY = y * scaleY;
+
+    ctx.save();
+    
+    // Create a radial gradient for the brush tip to handle hardness
+    const gradient = ctx.createRadialGradient(realX, realY, brushSize * brushHardness, realX, realY, brushSize);
+    
+    if (brushType === 'restore') {
+      gradient.addColorStop(0, `rgba(255, 255, 255, ${brushOpacity})`);
+      gradient.addColorStop(1, 'rgba(255, 255, 255, 0)');
+      
+      ctx.globalCompositeOperation = 'source-over';
+      // We use a temporary canvas to draw the restoration with softness
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = canvas.width;
+      tempCanvas.height = canvas.height;
+      const tCtx = tempCanvas.getContext('2d');
+      if (tCtx) {
+        tCtx.drawImage(originalImageElement, 0, 0, canvas.width, canvas.height);
+        
+        ctx.beginPath();
+        ctx.arc(realX, realY, brushSize, 0, Math.PI * 2);
+        ctx.fillStyle = gradient;
+        
+        // Use destination-in to mask the original image with our soft brush
+        tCtx.globalCompositeOperation = 'destination-in';
+        tCtx.fill();
+        
+        // Draw the result onto the main canvas
+        ctx.drawImage(tempCanvas, 0, 0);
+      }
+    } else {
+      gradient.addColorStop(0, `rgba(0, 0, 0, ${brushOpacity})`);
+      gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+      
+      ctx.globalCompositeOperation = 'destination-out';
+      ctx.fillStyle = gradient;
+      ctx.beginPath();
+      ctx.arc(realX, realY, brushSize, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    
+    ctx.restore();
+  };
+
+  const refineEdges = useCallback(async (imgUrl: string, isDeep: boolean = false): Promise<string> => {
+    try {
+      const img = new Image();
+      img.src = imgUrl;
+      await new Promise((resolve) => (img.onload = resolve));
+
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return imgUrl;
+
+      canvas.width = img.width;
+      canvas.height = img.height;
+      ctx.drawImage(img, 0, 0);
+
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const data = imageData.data;
+
+      // Smart Alpha Matting (Simplified for absolute speed)
+      if (isDeep || img.width * img.height < 1500000) {
+        const threshold = isDeep ? 180 : 130;
+        const lowThreshold = isDeep ? 15 : 35;
+        const factor = isDeep ? 1.15 : 1.05;
+        
+        for (let i = 3; i < data.length; i += 4) {
+          const alpha = data[i];
+          if (alpha > threshold) {
+            data[i] = 255; 
+          } else if (alpha < lowThreshold) {
+            data[i] = 0;
+          } else {
+            data[i] = Math.min(255, alpha * factor);
+          }
+        }
+        ctx.putImageData(imageData, 0, 0);
+      }
+      
+      if (isDeep) {
+        // High-end edge anti-aliasing
+        ctx.globalCompositeOperation = 'destination-in';
+        ctx.filter = 'blur(0.45px) contrast(1.1) brightness(1.02)'; 
+        ctx.drawImage(canvas, 0, 0);
+      }
+
+      return canvas.toDataURL('image/png', 1.0);
+    } catch (e) {
+      console.error("Refinement logic failed", e);
+      return imgUrl;
+    }
+  }, []);
+
   const removeBatchBg = async () => {
     if (batchItems.length === 0 || isProcessing) return;
 
@@ -194,42 +371,71 @@ export default function App() {
     const updatedItems = [...batchItems];
 
     for (let i = 0; i < updatedItems.length; i++) {
-      // Reprocess if status is done and deep scan is toggled, otherwise skip done items
-      if (updatedItems[i].status === 'done' && !useDeepScan) continue;
-
-      setCurrentIndex(i);
-      updatedItems[i].status = 'processing';
-      updatedItems[i].progress = 10;
-      setBatchItems([...updatedItems]);
-
-      try {
-        const response = await removeBackground(updatedItems[i].original, {
-          model: (precisionMode === 'pro' || useDeepScan) ? 'isnet' : 'isnet_fp16',
-          device: 'gpu',
-          output: {
-            format: 'image/png',
-            quality: useDeepScan ? 1.0 : 0.8,
-          } as any,
-          progress: (p: any) => {
-            updatedItems[i].progress = Math.round(Number(p) * 100);
-            if (updatedItems[i].progress % 5 === 0) {
-              setBatchItems([...updatedItems]);
-            }
-          },
-        });
-        
-        const url = URL.createObjectURL(response);
-        updatedItems[i].processed = url;
-        updatedItems[i].status = 'done';
-        saveToHistory(updatedItems[i].original, url);
-      } catch (err) {
-        console.error(err);
-        updatedItems[i].status = 'error';
-      }
-      setBatchItems([...updatedItems]);
+      if (updatedItems[i].status === 'done') continue;
+      await processSingleItem(i, updatedItems);
     }
 
     setIsProcessing(false);
+  };
+
+  const processSingleItem = async (index: number, currentItems: BatchItem[]) => {
+    const item = currentItems[index];
+    if (item.status === 'done' || item.status === 'processing') return;
+
+    const needsJump = batchItems.every(it => it.status !== 'done') || currentIndex === index;
+    if (needsJump) {
+      setCurrentIndex(index);
+    }
+    
+    item.status = 'processing';
+    item.progress = 5;
+    item.status_label = 'Initializing...';
+    setBatchItems([...currentItems]);
+
+    try {
+      let lastUpdate = Date.now();
+      const response = await removeBackground(item.original, {
+        model: (precisionMode === 'pro') ? 'isnet' : 'isnet_fp16',
+        device: 'gpu',
+        output: {
+          format: 'image/png',
+          quality: 0.7, 
+        } as any,
+        progress: (p: any) => {
+          const now = Date.now();
+          if (now - lastUpdate > 200) { 
+            const prog = Math.min(95, Math.round(Number(p) * 100));
+            item.progress = prog;
+            
+            if (prog < 20) item.status_label = 'Loading AI Engine...';
+            else if (prog < 50) item.status_label = 'Scanning Content...';
+            else if (prog < 85) item.status_label = 'Removing Background...';
+            else item.status_label = 'Polishing Edges...';
+
+            setBatchItems([...currentItems]);
+            lastUpdate = now;
+          }
+        },
+      });
+      
+      let url = URL.createObjectURL(response);
+
+      // Fast auto-clean pass (only for Pro mode or if image is small)
+      if (precisionMode === 'pro') {
+        item.status_label = 'Deep Semantic Refinement...';
+        setBatchItems([...currentItems]);
+        url = await refineEdges(url, true);
+      }
+
+      item.processed = url;
+      item.status = 'done';
+      item.progress = 100;
+      saveToHistory(item.original, url);
+    } catch (err) {
+      console.error(err);
+      item.status = 'error';
+    }
+    setBatchItems([...currentItems]);
   };
 
   const downloadAll = async () => {
@@ -274,51 +480,70 @@ export default function App() {
     setCurrentIndex(0);
   };
 
-  const currentItem = batchItems[currentIndex];
-
-  const refineEdges = async () => {
+  const refineCurrentEdges = async () => {
     if (!currentItem || !currentItem.processed || isRefining) return;
 
     pushToUndo(batchItems);
     setIsRefining(true);
     try {
-      // We simulate AI edge refinement by using a small morphological erosion/dilation or high-pass filter 
-      // via a canvas. For a true "AI" experience, we could send it to Gemini, but since it's an image processing 
-      // task on the result, we'll implement a technical refinement filter.
-      
-      const img = new Image();
-      img.src = currentItem.processed;
-      await new Promise((resolve) => (img.onload = resolve));
-
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-
-      canvas.width = img.width;
-      canvas.height = img.height;
-      ctx.drawImage(img, 0, 0);
-
-      // Simple AI Refinement: Feathering and edge smoothing
-      // In a real app, this would be a more complex GPGPU shader or AI model call.
-      // We'll apply a slight alpha smoothing to soften harsh segmentation edges.
-      ctx.globalCompositeOperation = 'destination-in';
-      ctx.filter = 'blur(0.5px)'; // Subtle edge softening
-      ctx.drawImage(canvas, 0, 0);
-      
-      const refinedUrl = canvas.toDataURL('image/png');
+      const refinedUrl = await refineEdges(currentItem.processed, useDeepScan);
       const updatedItems = [...batchItems];
       updatedItems[currentIndex].processed = refinedUrl;
       setBatchItems(updatedItems);
-      
-      // Update history
       saveToHistory(currentItem.original, refinedUrl);
     } catch (e) {
       console.error("Refinement failed", e);
-      setError("AI Refinement failed to initialize.");
+      setError("Deep Semantic Refinement failed to initialize.");
     } finally {
       setIsRefining(false);
     }
   };
+
+  const getBinaryMask = (imgUrl: string): Promise<string> => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.src = imgUrl;
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return resolve(imgUrl);
+        
+        ctx.drawImage(img, 0, 0);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = imageData.data;
+        
+        for (let i = 0; i < data.length; i += 4) {
+          const alpha = data[i+3];
+          // User Requirement: Strict white for subject (alpha > 0), black for background
+          if (alpha > 0) {
+            data[i] = 255;
+            data[i+1] = 255;
+            data[i+2] = 255;
+            data[i+3] = 255;
+          } else {
+            data[i] = 0;
+            data[i+1] = 0;
+            data[i+2] = 0;
+            data[i+3] = 255;
+          }
+        }
+        ctx.putImageData(imageData, 0, 0);
+        resolve(canvas.toDataURL());
+      };
+    });
+  };
+
+  const [binaryMaskUrl, setBinaryMaskUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (showMask && currentItem?.processed) {
+      getBinaryMask(currentItem.processed).then(setBinaryMaskUrl);
+    } else {
+      setBinaryMaskUrl(null);
+    }
+  }, [showMask, currentItem?.processed]);
 
   return (
     <div className="min-h-screen bg-[#0A0A0A] text-[#E5E7EB] font-sans selection:bg-blue-600 selection:text-white">
@@ -437,21 +662,48 @@ export default function App() {
                               className={`w-full h-full object-contain ${currentItem.status === 'processing' ? 'blur-sm' : ''} transition-all`}
                             />
                           ) : (
-                            <div className="w-full h-full relative">
-                              {showPortraitBlur ? (
-                                <img 
-                                  src={currentItem.original} 
-                                  alt="Blurred Background" 
-                                  className="w-full h-full object-contain blur-[12px] opacity-60 scale-105 transition-all"
+                            <div className="w-full h-full relative group/slider">
+                              {/* Background Layer (Checkerboard or Blur) */}
+                              <div className="absolute inset-0">
+                                {showPortraitBlur ? (
+                                  <img 
+                                    src={currentItem.original} 
+                                    alt="Blurred Background" 
+                                    className="w-full h-full object-contain blur-[12px] opacity-60 scale-105"
+                                  />
+                                ) : (
+                                  <div className="absolute inset-0" style={{ backgroundColor: '#1a1a1a', backgroundImage: 'linear-gradient(45deg, #222 25%, transparent 25%), linear-gradient(-45deg, #222 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #222 75%), linear-gradient(-45deg, transparent 75%, #222 75%)', backgroundSize: '20px 20px', backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0px' }}></div>
+                                )}
+                              </div>
+
+                              {/* Canvas for Manual Brush Editing */}
+                              <div className={`absolute inset-0 z-40 ${isBrushMode ? 'block' : 'hidden'}`}>
+                                <canvas
+                                  ref={canvasRef}
+                                  onMouseDown={startDrawing}
+                                  onMouseMove={draw}
+                                  onMouseUp={stopDrawing}
+                                  onMouseOut={stopDrawing}
+                                  onTouchStart={startDrawing}
+                                  onTouchMove={draw}
+                                  onTouchEnd={stopDrawing}
+                                  className="w-full h-full object-contain cursor-crosshair"
                                 />
-                              ) : (
-                                <div className="absolute inset-0" style={{ backgroundColor: '#1a1a1a', backgroundImage: 'linear-gradient(45deg, #222 25%, transparent 25%), linear-gradient(-45deg, #222 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #222 75%), linear-gradient(-45deg, transparent 75%, #222 75%)', backgroundSize: '20px 20px', backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0px' }}></div>
-                              )}
-                              <img 
-                                src={currentItem.processed} 
-                                alt="Processed" 
-                                className="w-full h-full object-contain absolute inset-0 z-10"
-                              />
+                                <style dangerouslySetInnerHTML={{ __html: `
+                                  .cursor-crosshair { 
+                                    cursor: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><circle cx="16" cy="16" r="14" fill="none" stroke="white" stroke-width="2"/><circle cx="16" cy="16" r="2" fill="white"/></svg>') 16 16, crosshair; 
+                                  }
+                                `}} />
+                              </div>
+
+                              {/* Subject Layer: Processed Result */}
+                              <div className={`w-full h-full relative z-10 ${isBrushMode ? 'opacity-0' : 'opacity-100'}`}>
+                                <img 
+                                  src={showMask && binaryMaskUrl ? binaryMaskUrl : currentItem.processed} 
+                                  alt="Processed" 
+                                  className={`w-full h-full object-contain ${showMask ? 'bg-black' : ''}`}
+                                />
+                              </div>
                             </div>
                           )}
                         </motion.div>
@@ -533,21 +785,56 @@ export default function App() {
                   ) : (
                     <>
                       {currentItem?.status === 'done' ? (
-                        <button
-                          onClick={downloadCurrent}
-                          className="w-full py-4 rounded-xl bg-blue-600 hover:bg-blue-700 font-bold text-sm flex items-center justify-center gap-2 transition-all active:scale-[0.98] text-white shadow-[0_0_25px_rgba(37,99,235,0.4)]"
-                        >
-                          <Download className="w-5 h-5" />
-                          Download result
-                        </button>
+                        <div className="flex flex-col gap-2">
+                          <button
+                            onClick={downloadCurrent}
+                            className="w-full py-4 rounded-xl bg-green-600 hover:bg-green-700 font-bold text-sm flex items-center justify-center gap-2 transition-all active:scale-[0.98] text-white shadow-[0_0_25px_rgba(22,163,74,0.4)]"
+                          >
+                            <Download className="w-5 h-5" />
+                            Download result
+                          </button>
+                          
+                          {batchItems.some((item, idx) => item.status === 'pending') && (
+                            <button
+                              onClick={() => {
+                                const nextPendingIdx = batchItems.findIndex((item, idx) => item.status === 'pending');
+                                if (nextPendingIdx !== -1) setCurrentIndex(nextPendingIdx);
+                              }}
+                              className="w-full py-3 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 font-bold text-[11px] uppercase tracking-widest text-blue-400 flex items-center justify-center gap-2 transition-all"
+                            >
+                              Go to Next Pending
+                              <ChevronRight className="w-4 h-4" />
+                            </button>
+                          )}
+                        </div>
                       ) : (
-                        <button
-                          onClick={removeBatchBg}
-                          className="w-full py-4 rounded-xl bg-blue-600 hover:bg-blue-700 font-bold text-sm flex items-center justify-center gap-2 transition-all active:scale-[0.98] text-white"
-                        >
-                          <Sparkles className="w-4 h-4" />
-                          Clear focus Background
-                        </button>
+                        <div className="flex flex-col gap-2">
+                          <button
+                            onClick={() => processSingleItem(currentIndex, [...batchItems])}
+                            disabled={currentItem?.status === 'processing'}
+                            className={`w-full py-4 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all active:scale-[0.98] text-white shadow-[0_0_20px_rgba(37,99,235,0.4)] ${currentItem?.status === 'processing' ? 'bg-blue-600/50 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`}
+                          >
+                            {currentItem?.status === 'processing' ? (
+                              <>
+                                <Loader2 className="w-5 h-5 animate-spin" />
+                                Processing... {currentItem.progress}%
+                              </>
+                            ) : (
+                              <>
+                                <Sparkles className="w-5 h-5 text-white/80" />
+                                Remove Background
+                              </>
+                            )}
+                          </button>
+                          {batchItems.filter(i => i.status === 'pending').length > 1 && !isProcessing && (
+                            <button
+                              onClick={removeBatchBg}
+                              className="w-full py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 font-medium text-[10px] uppercase tracking-widest text-gray-400 flex items-center justify-center gap-2 transition-all"
+                            >
+                              Process All Queue ({batchItems.filter(i => i.status === 'pending').length})
+                            </button>
+                          )}
+                        </div>
                       )}
 
                       {batchItems.some(item => item.status === 'done') && batchItems.length > 1 && (
@@ -565,25 +852,125 @@ export default function App() {
                   <div className="grid grid-cols-2 gap-3">
                     {currentItem?.status === 'done' && (
                       <div className="col-span-2 grid grid-cols-2 gap-3">
-                        <button
-                          onClick={() => setShowPortraitBlur(!showPortraitBlur)}
-                          className={`py-4 rounded-xl border text-[11px] uppercase tracking-wider font-semibold transition-all flex items-center justify-center gap-2 ${showPortraitBlur ? 'bg-blue-600/20 border-blue-500 text-blue-400' : 'bg-[#1A1A1A] border-[#262626] text-gray-500 hover:text-white'}`}
-                        >
-                          <Sparkles className="w-4 h-4" />
-                          {showPortraitBlur ? 'Transparency' : 'Portrait'}
-                        </button>
-                        <button
-                          onClick={refineEdges}
-                          disabled={isRefining}
-                          className={`py-4 rounded-xl border text-[11px] uppercase tracking-wider font-semibold transition-all flex items-center justify-center gap-2 bg-[#1A1A1A] border-[#262626] text-gray-500 hover:text-white disabled:opacity-50`}
-                        >
-                          {isRefining ? (
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                          ) : (
-                            <Layers className="w-4 h-4" />
-                          )}
-                          {isRefining ? 'Refining...' : 'AI Refine'}
-                        </button>
+                        {isBrushMode ? (
+                          <div className="col-span-2 bg-[#1A1A1A] p-4 rounded-xl border border-blue-500/30 flex flex-col gap-4">
+                            <div className="flex items-center justify-between">
+                              <div className="flex gap-2">
+                                <button 
+                                  onClick={() => setBrushType('restore')}
+                                  className={`px-4 py-2 rounded-lg text-[10px] font-bold uppercase transition-all flex items-center gap-2 ${brushType === 'restore' ? 'bg-green-600 text-white shadow-[0_0_15px_rgba(22,163,74,0.5)]' : 'bg-[#262626] text-gray-500'}`}
+                                >
+                                  <div className="w-1.5 h-1.5 rounded-full bg-current animate-pulse"></div>
+                                  Magic Restore
+                                </button>
+                                <button 
+                                  onClick={() => setBrushType('erase')}
+                                  className={`px-4 py-2 rounded-lg text-[10px] font-bold uppercase transition-all flex items-center gap-2 ${brushType === 'erase' ? 'bg-red-600 text-white shadow-[0_0_15px_rgba(220,38,38,0.5)]' : 'bg-[#262626] text-gray-500'}`}
+                                >
+                                  <div className="w-1.5 h-1.5 rounded-full bg-current"></div>
+                                  Magic Erase
+                                </button>
+                              </div>
+                              <button 
+                                onClick={() => setIsBrushMode(false)}
+                                className="text-[10px] font-bold bg-blue-600 text-white hover:bg-blue-500 uppercase tracking-widest px-4 py-2 rounded-lg transition-colors shadow-lg"
+                              >
+                                Save Changes
+                              </button>
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                              <div className="flex flex-col gap-2">
+                                <div className="flex items-center justify-between">
+                                  <span className="text-[10px] text-gray-500 font-bold uppercase">Size</span>
+                                  <span className="text-[10px] text-gray-400 font-mono">{brushSize}px</span>
+                                </div>
+                                <input 
+                                  type="range" 
+                                  min="2" 
+                                  max="200" 
+                                  value={brushSize} 
+                                  onChange={(e) => setBrushSize(Number(e.target.value))}
+                                  className="accent-blue-600 h-1 bg-[#262626] rounded-full appearance-none cursor-pointer"
+                                />
+                              </div>
+
+                              <div className="flex flex-col gap-2">
+                                <div className="flex items-center justify-between">
+                                  <span className="text-[10px] text-gray-500 font-bold uppercase">Hardness</span>
+                                  <span className="text-[10px] text-gray-400 font-mono">{Math.round(brushHardness * 100)}%</span>
+                                </div>
+                                <input 
+                                  type="range" 
+                                  min="0" 
+                                  max="1" 
+                                  step="0.01"
+                                  value={brushHardness} 
+                                  onChange={(e) => setBrushHardness(Number(e.target.value))}
+                                  className="accent-blue-600 h-1 bg-[#262626] rounded-full appearance-none cursor-pointer"
+                                />
+                              </div>
+
+                              <div className="flex flex-col gap-2">
+                                <div className="flex items-center justify-between">
+                                  <span className="text-[10px] text-gray-500 font-bold uppercase">Opacity</span>
+                                  <span className="text-[10px] text-gray-400 font-mono">{Math.round(brushOpacity * 100)}%</span>
+                                </div>
+                                <input 
+                                  type="range" 
+                                  min="0.1" 
+                                  max="1" 
+                                  step="0.01"
+                                  value={brushOpacity} 
+                                  onChange={(e) => setBrushOpacity(Number(e.target.value))}
+                                  className="accent-blue-600 h-1 bg-[#262626] rounded-full appearance-none cursor-pointer"
+                                />
+                              </div>
+                            </div>
+                          </div>
+                        ) : (
+                          <>
+                            <button
+                              onClick={() => {
+                                setIsBrushMode(true);
+                                // Initialize canvas with current processed image
+                                if (canvasRef.current && currentItem.processed) {
+                                  const img = new Image();
+                                  img.src = currentItem.processed;
+                                  img.onload = () => {
+                                    const ctx = canvasRef.current?.getContext('2d');
+                                    if (ctx) {
+                                      canvasRef.current!.width = img.width;
+                                      canvasRef.current!.height = img.height;
+                                      ctx.drawImage(img, 0, 0);
+                                    }
+                                  };
+                                }
+                              }}
+                              className="py-4 rounded-xl border text-[11px] uppercase tracking-wider font-semibold transition-all flex items-center justify-center gap-2 bg-blue-600/10 border-blue-500/30 text-blue-400 hover:bg-blue-600/20"
+                            >
+                              <Eraser className="w-4 h-4" />
+                              Manual Fix
+                            </button>
+                            <button
+                              onClick={() => setShowMask(!showMask)}
+                              className={`py-4 rounded-xl border text-[11px] uppercase tracking-wider font-semibold transition-all flex items-center justify-center gap-2 ${showMask ? 'bg-indigo-600/20 border-indigo-500 text-indigo-400' : 'bg-[#1A1A1A] border-[#262626] text-gray-500 hover:text-white'}`}
+                            >
+                              <Layers className="w-4 h-4" />
+                              {showMask ? 'Binary Result' : 'Mask Mode'}
+                            </button>
+                          </>
+                        )}
+                        
+                        {!isBrushMode && (
+                          <button
+                            onClick={refineCurrentEdges}
+                            disabled={isRefining}
+                            className={`py-4 rounded-xl border text-[11px] uppercase tracking-wider font-semibold transition-all flex items-center justify-center gap-2 bg-[#1A1A1A] border-[#262626] text-gray-500 hover:text-white disabled:opacity-50 col-span-2`}
+                          >
+                            {isRefining ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                            {isRefining ? 'AI Refining...' : 'Deep Semantic Refinement'}
+                          </button>
+                        )}
                       </div>
                     )}
                     <button
@@ -610,6 +997,15 @@ export default function App() {
         {/* Batch Sidebar List */}
         {batchItems.length > 0 && (
           <div className="w-full lg:w-72 space-y-4">
+            {gpuEnabled === false && (
+              <div className="p-3 bg-red-950/30 border border-red-500/30 rounded-xl flex gap-3 animate-in fade-in slide-in-from-top-2">
+                <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <p className="text-[10px] font-bold text-red-400 uppercase tracking-wider">GPU Missing</p>
+                  <p className="text-[9px] text-red-300/70 leading-relaxed">Processing will be much slower. Enable Hardware Acceleration in browser settings for 10x speed.</p>
+                </div>
+              </div>
+            )}
             <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-500">Processing Queue ({batchItems.length})</h3>
             <div className="space-y-2 max-h-[500px] overflow-y-auto pr-2 custom-scrollbar">
               {batchItems.map((item, idx) => (
@@ -626,10 +1022,26 @@ export default function App() {
                   </div>
                   <div className="flex-1 min-w-0">
                     <p className="text-[11px] font-medium truncate">{item.name}</p>
-                    <div className="flex items-center gap-2 mt-1">
-                      {item.status === 'processing' && <div className="w-full h-1 bg-[#262626] rounded-full overflow-hidden"><div className="h-full bg-blue-500" style={{ width: `${item.progress}%` }} /></div>}
+                    <div className="flex flex-col gap-1 mt-1">
+                      {item.status === 'processing' && (
+                        <>
+                          <div className="w-full h-1 bg-[#262626] rounded-full overflow-hidden">
+                            <div className="h-full bg-blue-500 transition-all duration-300" style={{ width: `${item.progress}%` }} />
+                          </div>
+                          <span className="text-[7px] text-blue-400 uppercase font-bold tracking-tighter truncate animate-pulse">
+                            {item.status_label || 'Processing...'}
+                          </span>
+                        </>
+                      )}
                       {item.status === 'done' && <span className="text-[9px] text-green-500 font-bold uppercase tracking-widest">Done</span>}
-                      {item.status === 'pending' && <span className="text-[9px] text-gray-500 font-bold uppercase tracking-widest">Pending</span>}
+                      {item.status === 'pending' && (
+                        <button 
+                          onClick={(e) => { e.stopPropagation(); processSingleItem(idx, [...batchItems]); }}
+                          className="text-[9px] text-blue-500 font-bold uppercase tracking-widest hover:text-blue-400"
+                        >
+                          Process
+                        </button>
+                      )}
                     </div>
                   </div>
                   {item.status === 'done' && <CheckCircle2 className="w-4 h-4 text-green-500" />}
@@ -721,33 +1133,34 @@ export default function App() {
       {/* Footer Info */}
       <footer className="fixed bottom-0 left-0 right-0 p-6 bg-[#0A0A0A] border-t border-[#262626] flex items-center justify-center gap-6 z-50">
         <button 
-          onClick={() => setPrecisionMode(prev => prev === 'standard' ? 'pro' : 'standard')}
+          onClick={() => {
+            setPrecisionMode(prev => prev === 'standard' ? 'pro' : 'standard');
+            setUndoStack([]); // Clear stacks when model changes to prevent mixed results
+          }}
           className="flex items-center gap-2 group"
-          title={precisionMode === 'pro' ? "Pro Mode: Maximum accuracy for complex images (Slower)" : "Standard Mode: High-speed engine (Faster)"}
+          title={precisionMode === 'pro' ? "Pro Engine: Higher accuracy for complex details (Hair/Portraits)" : "Turbo Engine: Very fast background removal"}
         >
-          <div className={`w-8 h-4 rounded-full relative transition-colors ${precisionMode === 'pro' ? 'bg-blue-600' : 'bg-[#262626]'}`}>
-            <div className={`absolute top-1 bottom-1 w-2 h-2 rounded-full shadow-[0_0_8px_rgba(59,130,246,0.5)] transition-all ${precisionMode === 'pro' ? 'right-1 bg-white' : 'left-1 bg-blue-500'}`}></div>
+          <div className={`w-8 h-4 rounded-full relative transition-colors ${precisionMode === 'pro' ? 'bg-indigo-600' : 'bg-[#262626]'}`}>
+            <div className={`absolute top-1 bottom-1 w-2 h-2 rounded-full shadow-[0_0_8px_rgba(99,102,241,0.5)] transition-all ${precisionMode === 'pro' ? 'right-1 bg-white' : 'left-1 bg-indigo-500'}`}></div>
           </div>
-          <span className={`text-[10px] uppercase tracking-widest transition-colors ${precisionMode === 'pro' ? 'text-blue-400' : 'text-gray-500'}`}>
-            Neural Mode: {precisionMode === 'pro' ? 'Pro' : 'Active'}
+          <span className={`text-[10px] uppercase tracking-widest transition-colors ${precisionMode === 'pro' ? 'text-indigo-400' : 'text-gray-500'}`}>
+            Engine: {precisionMode === 'pro' ? 'Pro HD' : 'Turbo'}
           </span>
         </button>
 
         <div className="h-4 w-px bg-[#262626]"></div>
 
         <button 
-          onClick={() => {
-            setUseDeepScan(!useDeepScan);
-            if (!useDeepScan) setPrecisionMode('pro');
-          }}
+          onClick={refineCurrentEdges}
+          disabled={isRefining}
           className="flex items-center gap-2 group"
-          title="Deep Preservation: Specialized mode to keep body parts and hair intact"
+          title="Neural Edge Refinement: Analyzes and smoothens edges automatically"
         >
-          <div className={`w-8 h-4 rounded-full relative transition-colors ${useDeepScan ? 'bg-indigo-600' : 'bg-[#262626]'}`}>
-            <div className={`absolute top-1 bottom-1 w-2 h-2 rounded-full shadow-[0_0_8px_rgba(99,102,241,0.5)] transition-all ${useDeepScan ? 'right-1 bg-white' : 'left-1 bg-indigo-500'}`}></div>
+          <div className={`w-8 h-4 rounded-full relative transition-colors ${isRefining ? 'bg-blue-400' : 'bg-[#262626]'}`}>
+            <div className={`absolute top-1 bottom-1 w-2 h-2 rounded-full shadow-[0_0_8px_rgba(59,130,246,0.5)] transition-all ${isRefining ? 'right-1 bg-white animate-pulse' : 'left-1 bg-blue-500'}`}></div>
           </div>
-          <span className={`text-[10px] uppercase tracking-widest transition-colors ${useDeepScan ? 'text-indigo-400' : 'text-gray-500'}`}>
-            Deep Preservation: {useDeepScan ? 'ON' : 'OFF'}
+          <span className={`text-[10px] uppercase tracking-widest transition-colors ${isRefining ? 'text-blue-400' : 'text-gray-500'}`}>
+            Auto Refine: {isRefining ? 'Active' : 'Ready'}
           </span>
         </button>
         <div className="h-4 w-px bg-[#262626]"></div>
