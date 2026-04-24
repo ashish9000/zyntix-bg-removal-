@@ -53,6 +53,7 @@ export default function App() {
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [precisionMode, setPrecisionMode] = useState<'standard' | 'pro'>('standard');
+  const [useDeepScan, setUseDeepScan] = useState(false);
   const [showPortraitBlur, setShowPortraitBlur] = useState(false);
   const [isRefining, setIsRefining] = useState(false);
   const [undoStack, setUndoStack] = useState<BatchItem[][]>([]);
@@ -193,7 +194,8 @@ export default function App() {
     const updatedItems = [...batchItems];
 
     for (let i = 0; i < updatedItems.length; i++) {
-      if (updatedItems[i].status === 'done') continue;
+      // Reprocess if status is done and deep scan is toggled, otherwise skip done items
+      if (updatedItems[i].status === 'done' && !useDeepScan) continue;
 
       setCurrentIndex(i);
       updatedItems[i].status = 'processing';
@@ -202,11 +204,14 @@ export default function App() {
 
       try {
         const response = await removeBackground(updatedItems[i].original, {
-          model: precisionMode === 'pro' ? 'isnet' : 'isnet_fp16',
-          device: 'gpu', // Force GPU acceleration if available
+          model: (precisionMode === 'pro' || useDeepScan) ? 'isnet' : 'isnet_fp16',
+          device: 'gpu',
+          output: {
+            format: 'image/png',
+            quality: useDeepScan ? 1.0 : 0.8,
+          } as any,
           progress: (p: any) => {
             updatedItems[i].progress = Math.round(Number(p) * 100);
-            // Throttle state updates for performance
             if (updatedItems[i].progress % 5 === 0) {
               setBatchItems([...updatedItems]);
             }
@@ -725,6 +730,24 @@ export default function App() {
           </div>
           <span className={`text-[10px] uppercase tracking-widest transition-colors ${precisionMode === 'pro' ? 'text-blue-400' : 'text-gray-500'}`}>
             Neural Mode: {precisionMode === 'pro' ? 'Pro' : 'Active'}
+          </span>
+        </button>
+
+        <div className="h-4 w-px bg-[#262626]"></div>
+
+        <button 
+          onClick={() => {
+            setUseDeepScan(!useDeepScan);
+            if (!useDeepScan) setPrecisionMode('pro');
+          }}
+          className="flex items-center gap-2 group"
+          title="Deep Preservation: Specialized mode to keep body parts and hair intact"
+        >
+          <div className={`w-8 h-4 rounded-full relative transition-colors ${useDeepScan ? 'bg-indigo-600' : 'bg-[#262626]'}`}>
+            <div className={`absolute top-1 bottom-1 w-2 h-2 rounded-full shadow-[0_0_8px_rgba(99,102,241,0.5)] transition-all ${useDeepScan ? 'right-1 bg-white' : 'left-1 bg-indigo-500'}`}></div>
+          </div>
+          <span className={`text-[10px] uppercase tracking-widest transition-colors ${useDeepScan ? 'text-indigo-400' : 'text-gray-500'}`}>
+            Deep Preservation: {useDeepScan ? 'ON' : 'OFF'}
           </span>
         </button>
         <div className="h-4 w-px bg-[#262626]"></div>
