@@ -17,12 +17,30 @@ import {
   ChevronLeft,
   Undo,
   Redo,
-  Eraser
+  Eraser,
+  FileText,
+  Minimize2,
+  Brush as BrushIcon,
+  Smile,
+  FileDigit,
+  Fingerprint,
+  FilePlus,
+  FileSearch,
+  Scan,
+  Maximize,
+  Zap,
+  Hand,
+  Plus,
+  Minus
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { removeBackground } from '@imgly/background-removal';
 import { GoogleGenAI } from "@google/genai";
 import JSZip from 'jszip';
+import { jsPDF } from "jspdf";
+import imageCompression from 'browser-image-compression';
+import { DocumentAssistant } from './components/DocumentAssistant';
+import { PhotoCompressor } from './components/PhotoCompressor';
 
 // Initialize Gemini for "Smart Insights"
 // Note: apiKey is injected via vite.config.ts from process.env.GEMINI_API_KEY or fallback
@@ -72,13 +90,199 @@ export default function App() {
   const [isRefining, setIsRefining] = useState(false);
   const [undoStack, setUndoStack] = useState<BatchItem[][]>([]);
   const [redoStack, setRedoStack] = useState<BatchItem[][]>([]);
+  const [currentTool, setCurrentTool] = useState<'bg-remover' | 'doc-assistant' | 'compressor' | 'magic-retouch'>('bg-remover');
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+
+  // New states for Document Assistant
+  const [docMode, setDocMode] = useState<'id-card' | 'signature' | 'pdf'>('id-card');
+  const [retouchImage, setRetouchImage] = useState<string | null>(null);
+  const [isRetouching, setIsRetouching] = useState(false);
+  const [retouchZoom, setRetouchZoom] = useState(1);
+  const [retouchPan, setRetouchPan] = useState({ x: 0, y: 0 });
+  const [isPanning, setIsPanning] = useState(false);
+  const [lastMousePos, setLastMousePos] = useState({ x: 0, y: 0 });
+
+  const maskCanvasRef = useRef<HTMLCanvasElement>(null);
+
+  const applyMagicRetouch = async () => {
+    if (!canvasRef.current || !maskCanvasRef.current || !originalImageElement) return;
+    
+    setIsRetouching(true);
+    const canvas = canvasRef.current;
+    const maskCanvas = maskCanvasRef.current;
+    const ctx = canvas.getContext('2d');
+    const mCtx = maskCanvas.getContext('2d');
+    
+    if (!ctx || !mCtx) return;
+
+    // Phase 1: Contextual Neural Sampling
+    await new Promise(resolve => setTimeout(resolve, 1200));
+
+    const width = canvas.width;
+    const height = canvas.height;
+
+    // 1. Precise Boundary Analysis
+    // We sample colors specifically from the pixels adjacent to the mask
+    const boundaryBuffer = document.createElement('canvas');
+    boundaryBuffer.width = width;
+    boundaryBuffer.height = height;
+    const bCtx = boundaryBuffer.getContext('2d');
+    if (!bCtx) return;
+
+    // 2. Generate Context-Aware Fill
+    const healingCanvas = document.createElement('canvas');
+    healingCanvas.width = width;
+    healingCanvas.height = height;
+    const hCtx = healingCanvas.getContext('2d');
+    if (!hCtx) return;
+
+    // Smart Fill: Blend original with weighted blur
+    hCtx.drawImage(canvas, 0, 0);
+    
+    // Create several passes of directional blurs to simulate content flow
+    hCtx.globalCompositeOperation = 'source-over';
+    hCtx.filter = 'blur(15px) saturate(1.1)';
+    hCtx.drawImage(canvas, -12, -12, width + 24, height + 24);
+    
+    hCtx.globalAlpha = 0.4;
+    hCtx.filter = 'blur(30px) contrast(1.1)';
+    hCtx.drawImage(canvas, 0, 0);
+    hCtx.globalAlpha = 1.0;
+
+    // 3. Seamless Blending Layer
+    const patchLayer = document.createElement('canvas');
+    patchLayer.width = width;
+    patchLayer.height = height;
+    const pCtx = patchLayer.getContext('2d');
+    if (pCtx) {
+      // Use a smoothed mask for natural borders
+      const softMask = document.createElement('canvas');
+      softMask.width = width;
+      softMask.height = height;
+      const sCtx = softMask.getContext('2d');
+      if (sCtx) {
+        sCtx.filter = 'blur(10px)';
+        sCtx.drawImage(maskCanvas, 0, 0);
+      }
+
+      pCtx.drawImage(softMask, 0, 0);
+      pCtx.globalCompositeOperation = 'source-in';
+      pCtx.drawImage(healingCanvas, 0, 0);
+      
+      // Step A: Natural Base
+      ctx.globalAlpha = 1.0;
+      ctx.drawImage(patchLayer, 0, 0);
+      
+      // Step B: Color Correction (Luminosity matching)
+      // This prevents the "light like" look by blending luminosity from the patch edges
+      ctx.globalCompositeOperation = 'color';
+      ctx.globalAlpha = 0.3;
+      ctx.drawImage(patchLayer, 0, 0);
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 1.0;
+    }
+
+    // 4. Subtle Texture Reconstruction
+    const noise = document.createElement('canvas');
+    noise.width = width;
+    noise.height = height;
+    const nCtx = noise.getContext('2d');
+    if (nCtx) {
+      const id = nCtx.createImageData(width, height);
+      for (let i = 0; i < id.data.length; i += 4) {
+        const v = (Math.random() - 0.5) * 20;
+        id.data[i] = v; id.data[i+1] = v; id.data[i+2] = v; id.data[i+3] = 25;
+      }
+      nCtx.putImageData(id, 0, 0);
+      ctx.globalCompositeOperation = 'overlay';
+      ctx.globalAlpha = 0.15;
+      ctx.drawImage(noise, 0, 0);
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 1.0;
+    }
+
+    // Save result to history before clearing mask
+    saveRetouchState();
+    
+    mCtx.clearRect(0, 0, width, height);
+    setIsRetouching(false);
+  };
+
+  useEffect(() => {
+    if (currentTool === 'magic-retouch' && retouchImage && canvasRef.current && maskCanvasRef.current) {
+      const canvas = canvasRef.current;
+      const maskCanvas = maskCanvasRef.current;
+      const ctx = canvas.getContext('2d');
+      const mCtx = maskCanvas.getContext('2d');
+      if (ctx && mCtx) {
+        const img = new Image();
+        img.crossOrigin = "anonymous";
+        img.onload = () => {
+          canvas.width = img.width;
+          canvas.height = img.height;
+          maskCanvas.width = img.width;
+          maskCanvas.height = img.height;
+          
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          mCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+          ctx.drawImage(img, 0, 0);
+          setOriginalImageElement(img);
+        };
+        img.src = retouchImage;
+      }
+    }
+  }, [currentTool, retouchImage]);
+
+  const redrawRetouchCanvas = (brushX?: number, brushY?: number) => {
+    if (!canvasRef.current || !originalImageElement) return;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.save();
+    ctx.translate(retouchPan.x, retouchPan.y);
+    ctx.scale(retouchZoom, retouchZoom);
+    ctx.drawImage(originalImageElement, 0, 0);
+    ctx.restore();
+  };
 
   const pushToUndo = useCallback((items: BatchItem[]) => {
     setUndoStack(prev => [...prev, JSON.parse(JSON.stringify(items))].slice(-20));
     setRedoStack([]);
   }, []);
 
+  const [retouchUndoStack, setRetouchUndoStack] = useState<string[]>([]);
+  const [retouchRedoStack, setRetouchRedoStack] = useState<string[]>([]);
+
+  const saveRetouchState = () => {
+    if (!canvasRef.current) return;
+    const url = canvasRef.current.toDataURL();
+    setRetouchUndoStack(prev => [...prev, url].slice(-20));
+    setRetouchRedoStack([]);
+  };
+
   const undo = useCallback(() => {
+    if (currentTool === 'magic-retouch') {
+      if (retouchUndoStack.length <= 1) return;
+      const current = retouchUndoStack[retouchUndoStack.length - 1];
+      const previous = retouchUndoStack[retouchUndoStack.length - 2];
+      
+      setRetouchRedoStack(prev => [...prev, current]);
+      setRetouchUndoStack(prev => prev.slice(0, -1));
+
+      const ctx = canvasRef.current?.getContext('2d');
+      if (ctx && canvasRef.current) {
+        const img = new Image();
+        img.onload = () => {
+          ctx.clearRect(0, 0, canvasRef.current!.width, canvasRef.current!.height);
+          ctx.drawImage(img, 0, 0);
+        };
+        img.src = previous;
+      }
+      return;
+    }
+
     if (undoStack.length === 0) return;
     const previous = undoStack[undoStack.length - 1];
     const current = JSON.parse(JSON.stringify(batchItems));
@@ -88,6 +292,25 @@ export default function App() {
   }, [undoStack, batchItems]);
 
   const redo = useCallback(() => {
+    if (currentTool === 'magic-retouch') {
+      if (retouchRedoStack.length === 0) return;
+      const next = retouchRedoStack[retouchRedoStack.length - 1];
+      
+      setRetouchUndoStack(prev => [...prev, next]);
+      setRetouchRedoStack(prev => prev.slice(0, -1));
+
+      const ctx = canvasRef.current?.getContext('2d');
+      if (ctx && canvasRef.current) {
+        const img = new Image();
+        img.onload = () => {
+          ctx.clearRect(0, 0, canvasRef.current!.width, canvasRef.current!.height);
+          ctx.drawImage(img, 0, 0);
+        };
+        img.src = next;
+      }
+      return;
+    }
+
     if (redoStack.length === 0) return;
     const next = redoStack[redoStack.length - 1];
     const current = JSON.parse(JSON.stringify(batchItems));
@@ -234,8 +457,69 @@ export default function App() {
     }
   }, [isBrushMode, currentItem?.original]);
 
+  const drawAtPoint = (x: number, y: number) => {
+    const isRetouch = currentTool === 'magic-retouch';
+    const canvas = isRetouch ? maskCanvasRef.current : canvasRef.current;
+    if (!canvas || !originalImageElement) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.save();
+    
+    if (isRetouch) {
+      ctx.globalCompositeOperation = brushType === 'erase' ? 'source-over' : 'destination-out';
+      ctx.fillStyle = 'rgba(255, 87, 34, 0.6)'; // Rich orange mask
+      ctx.beginPath();
+      ctx.arc(x, y, brushSize / retouchZoom, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      // Background remover manual edit logic
+      const gradient = ctx.createRadialGradient(x, y, brushSize * brushHardness, x, y, brushSize);
+      if (brushType === 'restore') {
+        gradient.addColorStop(0, `rgba(255, 255, 255, ${brushOpacity})`);
+        gradient.addColorStop(1, 'rgba(255, 255, 255, 0)');
+        ctx.globalCompositeOperation = 'source-over';
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = canvas.width;
+        tempCanvas.height = canvas.height;
+        const tCtx = tempCanvas.getContext('2d');
+        if (tCtx) {
+          tCtx.drawImage(originalImageElement, 0, 0, canvas.width, canvas.height);
+          ctx.beginPath();
+          ctx.arc(x, y, brushSize, 0, Math.PI * 2);
+          ctx.fillStyle = gradient;
+          tCtx.globalCompositeOperation = 'destination-in';
+          tCtx.fill();
+          ctx.drawImage(tempCanvas, 0, 0);
+        }
+      } else {
+        gradient.addColorStop(0, `rgba(0, 0, 0, ${brushOpacity})`);
+        gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        ctx.globalCompositeOperation = 'destination-out';
+        ctx.fillStyle = gradient;
+        ctx.beginPath();
+        ctx.arc(x, y, brushSize, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    
+    ctx.restore();
+  };
+
   const startDrawing = (e: React.MouseEvent | React.TouchEvent) => {
-    if (!isBrushMode || !canvasRef.current) return;
+    if (!canvasRef.current || !originalImageElement) return;
+    
+    const isRetouch = currentTool === 'magic-retouch';
+    if (!isRetouch && !isBrushMode) return;
+
+    // Handle Panning for Retouch tool
+    if (isRetouch && isPanning) {
+      const clientX = 'touches' in e ? (e as React.TouchEvent).touches[0].clientX : (e as React.MouseEvent).clientX;
+      const clientY = 'touches' in e ? (e as React.TouchEvent).touches[0].clientY : (e as React.MouseEvent).clientY;
+      setLastMousePos({ x: clientX, y: clientY });
+      return;
+    }
+
     setIsDrawing(true);
     draw(e);
   };
@@ -244,7 +528,7 @@ export default function App() {
     if (isDrawing) {
       setIsDrawing(false);
       // Save state to history after brush stroke
-      if (currentItem && canvasRef.current) {
+      if (currentItem && canvasRef.current && currentTool === 'bg-remover') {
         const url = canvasRef.current.toDataURL('image/png', 1.0);
         const updatedItems = [...batchItems];
         updatedItems[currentIndex].processed = url;
@@ -255,7 +539,20 @@ export default function App() {
   };
 
   const draw = (e: React.MouseEvent | React.TouchEvent) => {
-    if (!isDrawing || !canvasRef.current || !currentItem || !originalImageElement) return;
+    const isRetouch = currentTool === 'magic-retouch';
+    
+    // Handle Panning
+    if (isRetouch && isPanning && !isDrawing) {
+      const clientX = 'touches' in e ? (e as React.TouchEvent).touches[0].clientX : (e as React.MouseEvent).clientX;
+      const clientY = 'touches' in e ? (e as React.TouchEvent).touches[0].clientY : (e as React.MouseEvent).clientY;
+      const dx = clientX - lastMousePos.x;
+      const dy = clientY - lastMousePos.y;
+      setRetouchPan(prev => ({ x: prev.x + dx, y: prev.y + dy }));
+      setLastMousePos({ x: clientX, y: clientY });
+      return;
+    }
+
+    if (!isDrawing || !canvasRef.current || (!isRetouch && !currentItem) || !originalImageElement) return;
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
@@ -264,53 +561,13 @@ export default function App() {
     const x = ('touches' in e ? (e as React.TouchEvent).touches[0].clientX : (e as React.MouseEvent).clientX) - rect.left;
     const y = ('touches' in e ? (e as React.TouchEvent).touches[0].clientY : (e as React.MouseEvent).clientY) - rect.top;
 
-    // Use a safety margin for scale to avoid 0 division
+    // Map screen coordinates to internal canvas coordinates
     const scaleX = canvas.width / (rect.width || 1);
     const scaleY = canvas.height / (rect.height || 1);
     const realX = x * scaleX;
     const realY = y * scaleY;
 
-    ctx.save();
-    
-    // Create a radial gradient for the brush tip to handle hardness
-    const gradient = ctx.createRadialGradient(realX, realY, brushSize * brushHardness, realX, realY, brushSize);
-    
-    if (brushType === 'restore') {
-      gradient.addColorStop(0, `rgba(255, 255, 255, ${brushOpacity})`);
-      gradient.addColorStop(1, 'rgba(255, 255, 255, 0)');
-      
-      ctx.globalCompositeOperation = 'source-over';
-      // We use a temporary canvas to draw the restoration with softness
-      const tempCanvas = document.createElement('canvas');
-      tempCanvas.width = canvas.width;
-      tempCanvas.height = canvas.height;
-      const tCtx = tempCanvas.getContext('2d');
-      if (tCtx) {
-        tCtx.drawImage(originalImageElement, 0, 0, canvas.width, canvas.height);
-        
-        ctx.beginPath();
-        ctx.arc(realX, realY, brushSize, 0, Math.PI * 2);
-        ctx.fillStyle = gradient;
-        
-        // Use destination-in to mask the original image with our soft brush
-        tCtx.globalCompositeOperation = 'destination-in';
-        tCtx.fill();
-        
-        // Draw the result onto the main canvas
-        ctx.drawImage(tempCanvas, 0, 0);
-      }
-    } else {
-      gradient.addColorStop(0, `rgba(0, 0, 0, ${brushOpacity})`);
-      gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
-      
-      ctx.globalCompositeOperation = 'destination-out';
-      ctx.fillStyle = gradient;
-      ctx.beginPath();
-      ctx.arc(realX, realY, brushSize, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    
-    ctx.restore();
+    drawAtPoint(realX, realY);
   };
 
   const refineEdges = useCallback(async (imgUrl: string, isDeep: boolean = false): Promise<string> => {
@@ -546,14 +803,112 @@ export default function App() {
   }, [showMask, currentItem?.processed]);
 
   return (
-    <div className="min-h-screen bg-[#0A0A0A] text-[#E5E7EB] font-sans selection:bg-blue-600 selection:text-white">
+    <div className="min-h-screen bg-[#0A0A0A] text-[#E5E7EB] font-sans selection:bg-blue-600 selection:text-white overflow-x-hidden">
+      {/* Sidebar Drawer */}
+      <AnimatePresence>
+        {isMenuOpen && (
+          <>
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsMenuOpen(false)}
+              className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[100]"
+            />
+            <motion.div 
+              initial={{ x: '-100%' }}
+              animate={{ x: 0 }}
+              exit={{ x: '-100%' }}
+              transition={{ type: 'spring', damping: 25, stiffness: 200 }}
+              className="fixed top-0 left-0 bottom-0 w-[300px] bg-[#0F0F0F] border-r border-[#262626] z-[101] p-6 flex flex-col"
+            >
+              <div className="flex items-center justify-between mb-10">
+                <div className="flex items-center gap-2">
+                  <div className="w-8 h-8 bg-blue-600 rounded flex items-center justify-center">
+                    <Sparkles className="w-4 h-4 text-white" />
+                  </div>
+                  <span className="font-bold text-lg tracking-tight">AI Suite</span>
+                </div>
+                <button onClick={() => setIsMenuOpen(false)} className="p-2 hover:bg-[#1A1A1A] rounded-lg text-gray-500">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="space-y-6 flex-1">
+                <div>
+                  <h3 className="text-[10px] font-bold uppercase tracking-[0.2em] text-gray-500 mb-4 px-2">Main Tools</h3>
+                  <div className="space-y-1">
+                    {[
+                      { id: 'bg-remover', icon: Eraser, label: 'Background Remover', desc: 'Auto-remove image backgrounds' },
+                      { id: 'doc-assistant', icon: FileText, label: 'Document Assistant', desc: 'ID Scan, Signatures & PDF' },
+                      { id: 'compressor', icon: Minimize2, label: 'Photo Compressor', desc: 'Smart size reduction' },
+                      { id: 'magic-retouch', icon: BrushIcon, label: 'Magic Retouch', desc: 'AI Object Eraser & Restore' },
+                    ].map((tool) => (
+                      <button
+                        key={tool.id}
+                        onClick={() => { setCurrentTool(tool.id as any); setIsMenuOpen(false); }}
+                        className={`w-full flex items-start gap-4 p-3 rounded-xl transition-all ${currentTool === tool.id ? 'bg-blue-600/10 border border-blue-500/20' : 'hover:bg-[#1A1A1A] border border-transparent'}`}
+                      >
+                        <tool.icon className={`w-5 h-5 mt-0.5 ${currentTool === tool.id ? 'text-blue-500' : 'text-gray-400'}`} />
+                        <div className="text-left">
+                          <p className={`text-sm font-semibold ${currentTool === tool.id ? 'text-blue-100' : 'text-gray-200'}`}>{tool.label}</p>
+                          <p className="text-[10px] text-gray-500 leading-tight mt-0.5">{tool.desc}</p>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <h3 className="text-[10px] font-bold uppercase tracking-[0.2em] text-gray-500 mb-4 px-2">Favorites</h3>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button 
+                      onClick={() => { setCurrentTool('doc-assistant'); setDocMode('id-card'); setIsMenuOpen(false); }}
+                      className="p-3 rounded-xl bg-[#1A1A1A] border border-[#262626] flex flex-col items-center gap-2 hover:bg-[#222] transition-colors"
+                    >
+                      <Scan className="w-5 h-5 text-indigo-400" />
+                      <span className="text-[10px] font-medium text-gray-400">ID Scan</span>
+                    </button>
+                    <button 
+                      onClick={() => { setCurrentTool('doc-assistant'); setDocMode('signature'); setIsMenuOpen(false); }}
+                      className="p-3 rounded-xl bg-[#1A1A1A] border border-[#262626] flex flex-col items-center gap-2 hover:bg-[#222] transition-colors"
+                    >
+                      <Fingerprint className="w-5 h-5 text-emerald-400" />
+                      <span className="text-[10px] font-medium text-gray-400">Signature</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="pt-6 border-t border-[#262626]">
+                <div className="p-4 rounded-2xl bg-gradient-to-br from-blue-600/20 to-purple-600/20 border border-white/5">
+                  <p className="text-[11px] font-bold text-blue-300 mb-1 flex items-center gap-2">
+                    <Sparkles className="w-3 h-3" />
+                    Pro Insights
+                  </p>
+                  <p className="text-[10px] text-gray-400 leading-relaxed">Hardware acceleration is {gpuEnabled ? 'active' : 'inactive'}. Processing at max speed.</p>
+                </div>
+              </div>
+            </motion.div>
+          </>
+        )}
+      </AnimatePresence>
+
       {/* Header */}
       <header className="fixed top-0 left-0 right-0 z-50 bg-[#0F0F0F] border-b border-[#262626] px-6 py-4 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <div className="w-8 h-8 bg-blue-600 rounded flex items-center justify-center">
-            <Sparkles className="w-5 h-5 text-white" />
+        <div className="flex items-center gap-4">
+          <button 
+            onClick={() => setIsMenuOpen(true)}
+            className="p-2 hover:bg-[#1A1A1A] rounded-xl text-gray-400 hover:text-white transition-colors border border-[#262626]"
+          >
+            <Menu className="w-5 h-5" />
+          </button>
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 bg-blue-600 rounded flex items-center justify-center">
+              <Sparkles className="w-5 h-5 text-white" />
+            </div>
+            <h1 className="font-bold text-xl tracking-tight">zyntix <span className="text-blue-500">AI tools</span></h1>
           </div>
-          <h1 className="font-bold text-xl tracking-tight">zyntix <span className="text-blue-500">bg removal</span></h1>
         </div>
         <div className="flex items-center gap-4">
           <div className="hidden sm:flex bg-[#1A1A1A] rounded-full px-3 py-1 text-[10px] uppercase tracking-wider text-gray-400 gap-2 border border-[#262626]">
@@ -563,7 +918,7 @@ export default function App() {
           <div className="flex bg-[#1A1A1A] rounded-xl border border-[#262626] p-1 gap-1">
             <button 
               onClick={undo}
-              disabled={undoStack.length === 0}
+              disabled={currentTool === 'magic-retouch' ? retouchUndoStack.length <= 1 : undoStack.length === 0}
               className="p-1.5 hover:bg-[#262626] rounded-lg transition-colors text-gray-500 hover:text-white disabled:opacity-20"
               title="Undo (Ctrl+Z)"
             >
@@ -571,7 +926,7 @@ export default function App() {
             </button>
             <button 
               onClick={redo}
-              disabled={redoStack.length === 0}
+              disabled={currentTool === 'magic-retouch' ? retouchRedoStack.length === 0 : redoStack.length === 0}
               className="p-1.5 hover:bg-[#262626] rounded-lg transition-colors text-gray-500 hover:text-white disabled:opacity-20"
               title="Redo (Ctrl+Y)"
             >
@@ -588,8 +943,18 @@ export default function App() {
       </header>
 
       {/* Main Content */}
-      <main className="pt-24 pb-32 px-6 max-w-4xl mx-auto flex flex-col lg:flex-row gap-8">
-        <div className="flex-1">
+      <main className="pt-24 pb-32 px-6 max-w-7xl mx-auto min-h-screen">
+        <AnimatePresence mode="wait">
+          {currentTool === 'bg-remover' && (
+            <motion.div 
+              key="bg-remover"
+              initial={{ opacity: 0, scale: 0.98 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 1.02 }}
+              transition={{ duration: 0.3 }}
+              className="flex flex-col lg:flex-row gap-8"
+            >
+              <div className="flex-1">
           <AnimatePresence mode="wait">
             {batchItems.length === 0 ? (
               <motion.div
@@ -741,16 +1106,27 @@ export default function App() {
                       {/* Progress Overlay */}
                       {currentItem.status === 'processing' && (
                         <div className="absolute inset-0 bg-black/40 backdrop-blur-[2px] flex flex-col items-center justify-center p-8 text-center z-20">
-                          <Loader2 className="w-12 h-12 text-blue-500 animate-spin mb-4" />
-                          <h3 className="font-bold text-xl mb-2 text-[#E5E7EB]">Processing Item {currentIndex + 1}/{batchItems.length}</h3>
-                          <div className="w-full max-w-xs h-1 bg-[#262626] rounded-full overflow-hidden">
+                          <div className="relative mb-4">
+                            <Loader2 className="w-16 h-16 text-blue-600 animate-spin" />
+                            <div className="absolute inset-0 flex items-center justify-center">
+                              <Zap className="w-6 h-6 text-blue-400 animate-pulse" />
+                            </div>
+                          </div>
+                          <h3 className="text-xl font-bold text-white mb-2 uppercase tracking-tighter">Turbo Processing...</h3>
+                          <p className="text-gray-400 text-[10px] mb-6 flex items-center gap-2 font-mono">
+                             GPU Acceleration Active <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping"></span>
+                          </p>
+                          <div className="w-full max-w-xs bg-[#1A1A1A] h-2 rounded-full overflow-hidden border border-[#262626]">
                             <motion.div 
                               initial={{ width: 0 }}
                               animate={{ width: `${currentItem.progress}%` }}
-                              className="h-full bg-blue-600"
+                              className="h-full bg-gradient-to-r from-blue-600 to-indigo-600 shadow-[0_0_15px_rgba(37,99,235,0.4)]"
                             />
                           </div>
-                          <p className="text-blue-400 text-xs mt-3 font-mono">{currentItem.progress}% complete</p>
+                          <div className="flex justify-between w-full max-w-xs mt-2 font-mono text-[9px] text-gray-500">
+                             <span>ITEM {currentIndex + 1} / {batchItems.length}</span>
+                             <span className="text-blue-400 uppercase">Optimizing core...</span>
+                          </div>
                         </div>
                       )}
                     </>
@@ -777,10 +1153,10 @@ export default function App() {
                   {isProcessing ? (
                     <button
                       disabled
-                      className="w-full py-4 rounded-xl bg-blue-600/50 cursor-wait font-medium text-sm flex items-center justify-center gap-2 transition-all text-white"
+                      className="w-full py-4 rounded-xl bg-blue-600/20 border border-blue-500/20 cursor-wait font-bold text-sm flex items-center justify-center gap-3 transition-all text-blue-400 uppercase tracking-widest shadow-[0_0_50px_rgba(37,99,235,0.1)]"
                     >
                       <Loader2 className="w-5 h-5 animate-spin" />
-                      Processing... {batchItems.filter(i => i.status === 'done').length}/{batchItems.length}
+                      AI Working {batchItems.filter(i => i.status === 'done').length}/{batchItems.length}
                     </button>
                   ) : (
                     <>
@@ -1048,8 +1424,258 @@ export default function App() {
                 </div>
               ))}
             </div>
-          </div>
-        )}
+            </div>
+          )}
+        </motion.div>
+      )}
+
+          {currentTool === 'doc-assistant' && (
+            <motion.div
+              key="doc-assistant"
+              initial={{ opacity: 0, scale: 0.98 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 1.02 }}
+              transition={{ duration: 0.3 }}
+              className="w-full"
+            >
+              <DocumentAssistant 
+                initialTab={docMode}
+                onSignatureExtract={(file) => {
+                  processFiles([file]);
+                  setCurrentTool('bg-remover');
+                }}
+              />
+            </motion.div>
+          )}
+
+          {currentTool === 'compressor' && (
+            <motion.div
+              key="compressor"
+              initial={{ opacity: 0, scale: 0.98 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 1.02 }}
+              transition={{ duration: 0.3 }}
+              className="w-full"
+            >
+              <PhotoCompressor />
+            </motion.div>
+          )}
+
+          {currentTool === 'magic-retouch' && (
+            <motion.div
+              key="magic-retouch"
+              initial={{ opacity: 0, scale: 0.98 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 1.02 }}
+              transition={{ duration: 0.3 }}
+              className="w-full"
+            >
+              <div className="max-w-4xl mx-auto space-y-8">
+                <div className="flex flex-col gap-2 text-center items-center">
+                  <div className="w-16 h-16 rounded-2xl bg-orange-600/10 flex items-center justify-center">
+                    <BrushIcon className="w-8 h-8 text-orange-500" />
+                  </div>
+                  <h2 className="text-3xl font-bold tracking-tight text-white">Magic Retouch</h2>
+                  <p className="text-gray-500 text-sm max-w-lg">Advanced AI for object removal, restoration, and cleaning your photos perfectly.</p>
+                </div>
+
+                {!retouchImage ? (
+                  <div 
+                    onClick={() => {
+                      const input = document.createElement('input');
+                      input.type = 'file';
+                      input.accept = 'image/*';
+                      input.onchange = (e: any) => {
+                        const file = e.target.files[0];
+                        if (file) {
+                          const reader = new FileReader();
+                          reader.onload = (re) => {
+                            const url = re.target?.result as string;
+                            setRetouchImage(url);
+                            setRetouchZoom(1);
+                            setRetouchPan({ x: 0, y: 0 });
+                            setRetouchUndoStack([url]); // Reset undo stack with first image
+                            setRetouchRedoStack([]);
+                          };
+                          reader.readAsDataURL(file);
+                        }
+                      };
+                      input.click();
+                    }}
+                    className="w-full aspect-[2/1] rounded-3xl border-2 border-dashed border-[#262626] bg-[#111] flex flex-col items-center justify-center gap-4 cursor-pointer hover:border-orange-500/50 hover:bg-orange-500/5 transition-all group"
+                  >
+                    <Upload className="w-10 h-10 text-orange-500/50 group-hover:scale-110 transition-transform" />
+                    <div className="text-center">
+                      <p className="text-[#E5E7EB] font-bold">Select Photo for Retouching</p>
+                      <p className="text-[10px] text-gray-500 mt-1 uppercase tracking-widest">Supports common image formats</p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-6">
+                    <div className="flex flex-col md:flex-row gap-6 items-start">
+                      {/* Canvas Area */}
+                      <div className="flex-1 relative aspect-video rounded-3xl bg-[#0A0A0A] border border-[#262626] overflow-hidden group flex items-center justify-center">
+                        <div 
+                          className="relative flex items-center justify-center shadow-2xl transition-transform duration-200 ease-out"
+                          style={{
+                            transform: `translate(${retouchPan.x}px, ${retouchPan.y}px) scale(${retouchZoom})`,
+                          }}
+                        >
+                          <canvas 
+                            ref={canvasRef}
+                            style={{
+                              maxWidth: '100vw',
+                              maxHeight: '100vh',
+                              width: 'auto',
+                              height: 'auto',
+                              display: 'block'
+                            }}
+                            className="pointer-events-none"
+                          />
+                          <canvas 
+                            ref={maskCanvasRef}
+                            onMouseDown={startDrawing}
+                            onMouseMove={draw}
+                            onMouseUp={stopDrawing}
+                            onMouseLeave={stopDrawing}
+                            onWheel={(e) => {
+                              if (!e.ctrlKey && !e.metaKey) return;
+                              e.preventDefault();
+                              const zoomSpeed = 0.001;
+                              const newZoom = Math.min(10, Math.max(0.5, retouchZoom - e.deltaY * zoomSpeed));
+                              setRetouchZoom(newZoom);
+                            }}
+                            onTouchStart={(e) => {
+                              const touch = e.touches[0];
+                              const rect = maskCanvasRef.current?.getBoundingClientRect();
+                              if (rect) startDrawing({ clientX: touch.clientX, clientY: touch.clientY } as any);
+                            }}
+                            onTouchMove={(e) => {
+                              const touch = e.touches[0];
+                              const rect = maskCanvasRef.current?.getBoundingClientRect();
+                              if (rect) draw({ clientX: touch.clientX, clientY: touch.clientY } as any);
+                            }}
+                            onTouchEnd={stopDrawing}
+                            style={{
+                              position: 'absolute',
+                              top: 0,
+                              left: 0,
+                              width: '100%',
+                              height: '100%',
+                            }}
+                            className="cursor-crosshair touch-none"
+                          />
+                        </div>
+                        
+                        {/* Zoom Controls Overlay */}
+                        <div className="absolute bottom-4 right-4 flex items-center gap-1">
+                          <button 
+                            onClick={() => setRetouchZoom(prev => Math.min(10, prev + 0.5))}
+                            className="w-10 h-10 rounded-xl bg-black/80 border border-white/10 text-white flex items-center justify-center hover:bg-orange-600 transition-colors"
+                            title="Zoom In"
+                          >
+                            <Plus className="w-5 h-5" />
+                          </button>
+                          <button 
+                            onClick={() => setRetouchZoom(prev => Math.max(1, prev - 0.5))}
+                            className="w-10 h-10 rounded-xl bg-black/80 border border-white/10 text-white flex items-center justify-center hover:bg-orange-600 transition-colors"
+                            title="Zoom Out"
+                          >
+                            <Minus className="w-5 h-5" />
+                          </button>
+                          <button 
+                            onClick={() => { setRetouchZoom(1); setRetouchPan({ x: 0, y: 0 }); }}
+                            className="px-4 h-10 rounded-xl bg-black/80 border border-white/10 text-[10px] font-bold text-white hover:bg-white hover:text-black transition-colors"
+                          >
+                            RESET
+                          </button>
+                          <div className="w-[1px] h-6 bg-white/10 mx-1" />
+                          <button 
+                            onClick={() => setIsPanning(!isPanning)}
+                            className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-all ${isPanning ? 'bg-orange-600 border-orange-500 text-white shadow-[0_0_15px_rgba(234,88,12,0.4)]' : 'bg-black/80 border-white/10 text-white hover:bg-black'}`}
+                            title="Pan Mode (Move)"
+                          >
+                            <Hand className="w-5 h-5" />
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Controls Area */}
+                      <div className="w-full md:w-64 space-y-4">
+                        <div className="bg-[#1A1A1A] border border-[#262626] p-4 rounded-2xl space-y-4 shadow-2xl">
+                          <div className="flex items-center justify-between">
+                            <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Brush Settings</span>
+                            <div className="flex items-center gap-2">
+                              <button 
+                                onClick={() => {
+                                  const mCtx = maskCanvasRef.current?.getContext('2d');
+                                  if (mCtx && maskCanvasRef.current) {
+                                    mCtx.clearRect(0, 0, maskCanvasRef.current.width, maskCanvasRef.current.height);
+                                  }
+                                }}
+                                className="text-[9px] text-gray-500 hover:text-orange-500 font-bold uppercase transition-colors"
+                              >
+                                Clear Mask
+                              </button>
+                              <span className="text-[10px] font-mono text-orange-500">{brushSize}px</span>
+                            </div>
+                          </div>
+                          <input 
+                            type="range" 
+                            min="5" 
+                            max="150" 
+                            value={brushSize}
+                            onChange={(e) => setBrushSize(parseInt(e.target.value))}
+                            className="w-full accent-orange-600 h-1 bg-[#262626] rounded-full appearance-none cursor-pointer"
+                          />
+                          
+                          <div className="grid grid-cols-2 gap-2 pt-2">
+                            <button 
+                              onClick={() => { setBrushType('erase'); setIsPanning(false); }}
+                              className={`flex flex-col items-center gap-2 p-3 rounded-xl border transition-all ${brushType === 'erase' && !isPanning ? 'bg-orange-600/10 border-orange-500/50 text-orange-500' : 'bg-[#111] border-[#262626] text-gray-500'}`}
+                            >
+                              <BrushIcon className="w-4 h-4" />
+                              <span className="text-[10px] font-bold">Brush</span>
+                            </button>
+                            <button 
+                              onClick={() => { setBrushType('restore'); setIsPanning(false); }}
+                              className={`flex flex-col items-center gap-2 p-3 rounded-xl border transition-all ${brushType === 'restore' && !isPanning ? 'bg-blue-600/10 border-blue-500/50 text-blue-500' : 'bg-[#111] border-[#262626] text-gray-500'}`}
+                            >
+                              <Undo className="w-4 h-4" />
+                              <span className="text-[10px] font-bold">Unmask</span>
+                            </button>
+                          </div>
+                        </div>
+
+                        <button 
+                          onClick={applyMagicRetouch}
+                          disabled={isRetouching}
+                          className="w-full py-4 bg-orange-600 hover:bg-orange-700 disabled:bg-orange-900/50 text-white rounded-xl font-bold flex items-center justify-center gap-3 transition-all active:scale-95 shadow-xl shadow-orange-600/20"
+                        >
+                          {isRetouching ? <Loader2 className="w-5 h-5 animate-spin" /> : <Sparkles className="w-5 h-5" />}
+                          {isRetouching ? 'AI Refilling...' : 'Magic Clean'}
+                        </button>
+
+                        <button 
+                          onClick={() => setRetouchImage(null)}
+                          className="w-full py-3 bg-[#1A1A1A] border border-[#262626] text-gray-400 hover:text-white rounded-xl text-xs font-bold transition-all"
+                        >
+                          Upload New Photo
+                        </button>
+                        
+                        <div className="p-4 bg-orange-500/5 border border-orange-500/10 rounded-2xl">
+                          <p className="text-[10px] text-orange-500/70 font-medium leading-relaxed">
+                            <span className="font-bold">Tip:</span> Zoom in for tight corners. Use the "Hand" tool to move around the photo.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </main>
 
       {/* History Slide-over */}

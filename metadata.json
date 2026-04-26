@@ -1,6 +1,6 @@
 {
-  "name": "zyntix bg removal",
-  "description": "Professional background removal using advanced on-device AI technology.",
+  "name": "Zyntix AI Document Suite",
+  "description": "All-in-one AI tools for ID scanning, photo compression under 50KB, background removal, and PDF conversion.",
   "requestFramePermissions": [],
   "majorCapabilities": []
 }
