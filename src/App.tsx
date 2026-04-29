@@ -28,6 +28,9 @@ import {
   FileSearch,
   Scan,
   Maximize,
+  RotateCcw,
+  Settings,
+  Shield,
   Zap,
   Hand,
   Plus,
@@ -39,12 +42,16 @@ import { GoogleGenAI } from "@google/genai";
 import JSZip from 'jszip';
 import { jsPDF } from "jspdf";
 import imageCompression from 'browser-image-compression';
+import Cropper from 'react-easy-crop';
+import Markdown from 'react-markdown';
 import { DocumentAssistant } from './components/DocumentAssistant';
 import { PhotoCompressor } from './components/PhotoCompressor';
 
 // Initialize Gemini for "Smart Insights"
 // Note: apiKey is injected via vite.config.ts from process.env.GEMINI_API_KEY or fallback
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+// Initialize Gemini for "Smart Insights"
 
 interface ProcessedImage {
   id: string;
@@ -90,8 +97,21 @@ export default function App() {
   const [isRefining, setIsRefining] = useState(false);
   const [undoStack, setUndoStack] = useState<BatchItem[][]>([]);
   const [redoStack, setRedoStack] = useState<BatchItem[][]>([]);
-  const [currentTool, setCurrentTool] = useState<'bg-remover' | 'doc-assistant' | 'compressor' | 'magic-retouch'>('bg-remover');
+  const [retouchUndoStack, setRetouchUndoStack] = useState<string[]>([]);
+  const [retouchRedoStack, setRetouchRedoStack] = useState<string[]>([]);
+  const [currentTool, setCurrentTool] = useState<'bg-remover' | 'doc-assistant' | 'compressor' | 'magic-retouch' | 'crop-tool' | 'smart-writer'>('bg-remover');
   const [isMenuOpen, setIsMenuOpen] = useState(false);
+
+  // New states for Smart Writer
+  const [writerMode, setWriterMode] = useState<'resume' | 'letter'>('resume');
+  const [writerContent, setWriterContent] = useState('');
+  const [writerPrompt, setWriterPrompt] = useState('');
+  const [isGeneratingWriter, setIsGeneratingWriter] = useState(false);
+
+  // New states for Crop Tool
+  const [cropImage, setCropImage] = useState<string | null>(null);
+  const [cropRatio, setCropRatio] = useState<number | null>(null); // null means free aspect
+  const [isCropping, setIsCropping] = useState(false);
 
   // New states for Document Assistant
   const [docMode, setDocMode] = useState<'id-card' | 'signature' | 'pdf'>('id-card');
@@ -101,8 +121,32 @@ export default function App() {
   const [retouchPan, setRetouchPan] = useState({ x: 0, y: 0 });
   const [isPanning, setIsPanning] = useState(false);
   const [lastMousePos, setLastMousePos] = useState({ x: 0, y: 0 });
-
+  const [showOriginal, setShowOriginal] = useState(false);
   const maskCanvasRef = useRef<HTMLCanvasElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  const [isBrushMode, setIsBrushMode] = useState(false);
+  const [brushSize, setBrushSize] = useState(30);
+  const [brushHardness, setBrushHardness] = useState(0.5);
+  const [brushOpacity, setBrushOpacity] = useState(1.0);
+  const [brushType, setBrushType] = useState<'restore' | 'erase'>('restore');
+  const [originalImageElement, setOriginalImageElement] = useState<HTMLImageElement | null>(null);
+  const [isDrawing, setIsDrawing] = useState(false);
+
+  const autoFixImage = () => {
+    if (!canvasRef.current || !originalImageElement) return;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    if (saveRetouchState) saveRetouchState();
+    ctx.save();
+    // Premium Auto-Fix: Levels, Contrast, and Vibrance simulation
+    ctx.filter = 'contrast(1.15) saturate(1.1) brightness(1.02) sepia(0.02) hue-rotate(1deg)';
+    ctx.drawImage(canvas, 0, 0);
+    ctx.restore();
+    if (saveRetouchState) saveRetouchState();
+  };
 
   const applyMagicRetouch = async () => {
     if (!canvasRef.current || !maskCanvasRef.current || !originalImageElement) return;
@@ -173,11 +217,16 @@ export default function App() {
       ctx.globalAlpha = 1.0;
       ctx.drawImage(patchLayer, 0, 0);
       
-      // Step B: Color Correction (Luminosity matching)
-      // This prevents the "light like" look by blending luminosity from the patch edges
+      // Step B: Color Correction (Deep color matching)
+      // We perform a luminosity and color blend from surrounding pixels
       ctx.globalCompositeOperation = 'color';
-      ctx.globalAlpha = 0.3;
+      ctx.globalAlpha = 0.45;
       ctx.drawImage(patchLayer, 0, 0);
+      
+      ctx.globalCompositeOperation = 'overlay';
+      ctx.globalAlpha = 0.2;
+      ctx.drawImage(patchLayer, 0, 0);
+      
       ctx.globalCompositeOperation = 'source-over';
       ctx.globalAlpha = 1.0;
     }
@@ -247,22 +296,21 @@ export default function App() {
     ctx.restore();
   };
 
+  // --- Logic Functions (Hoisted) ---
+
   const pushToUndo = useCallback((items: BatchItem[]) => {
     setUndoStack(prev => [...prev, JSON.parse(JSON.stringify(items))].slice(-20));
     setRedoStack([]);
   }, []);
 
-  const [retouchUndoStack, setRetouchUndoStack] = useState<string[]>([]);
-  const [retouchRedoStack, setRetouchRedoStack] = useState<string[]>([]);
-
-  const saveRetouchState = () => {
+  const saveRetouchState = useCallback(() => {
     if (!canvasRef.current) return;
     const url = canvasRef.current.toDataURL();
     setRetouchUndoStack(prev => [...prev, url].slice(-20));
     setRetouchRedoStack([]);
-  };
+  }, [canvasRef]);
 
-  const undo = useCallback(() => {
+  const handleUndo = useCallback(() => {
     if (currentTool === 'magic-retouch') {
       if (retouchUndoStack.length <= 1) return;
       const current = retouchUndoStack[retouchUndoStack.length - 1];
@@ -289,9 +337,9 @@ export default function App() {
     setRedoStack(prev => [...prev, current]);
     setUndoStack(prev => prev.slice(0, -1));
     setBatchItems(previous);
-  }, [undoStack, batchItems]);
+  }, [currentTool, retouchUndoStack, undoStack, batchItems]);
 
-  const redo = useCallback(() => {
+  const handleRedo = useCallback(() => {
     if (currentTool === 'magic-retouch') {
       if (retouchRedoStack.length === 0) return;
       const next = retouchRedoStack[retouchRedoStack.length - 1];
@@ -317,27 +365,46 @@ export default function App() {
     setUndoStack(prev => [...prev, current]);
     setRedoStack(prev => prev.slice(0, -1));
     setBatchItems(next);
-  }, [redoStack, batchItems]);
+  }, [currentTool, retouchRedoStack, redoStack, batchItems]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      const key = e.key.toLowerCase();
+
       if (e.ctrlKey || e.metaKey) {
-        if (e.key.toLowerCase() === 'z') {
+        if (key === 'z') {
           e.preventDefault();
           if (e.shiftKey) {
-            redo();
+            handleRedo();
           } else {
-            undo();
+            handleUndo();
           }
-        } else if (e.key.toLowerCase() === 'y') {
+        } else if (key === 'y') {
           e.preventDefault();
-          redo();
+          handleRedo();
+        }
+      }
+
+      // Magic Retouch specific shortcuts
+      if (currentTool === 'magic-retouch') {
+        if (key === 'b') { 
+          setBrushType('erase'); 
+          setIsPanning(false); 
+        }
+        if (key === 'h') {
+          setIsPanning(true);
+        }
+        if (key === '[') {
+          setBrushSize(prev => Math.max(5, prev - 5));
+        }
+        if (key === ']') {
+          setBrushSize(prev => Math.min(150, prev + 5));
         }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [undo, redo]);
+  }, [handleUndo, handleRedo, currentTool]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -436,15 +503,6 @@ export default function App() {
   };
 
   const currentItem = batchItems[currentIndex];
-
-  const [isBrushMode, setIsBrushMode] = useState(false);
-  const [brushSize, setBrushSize] = useState(30);
-  const [brushHardness, setBrushHardness] = useState(0.5);
-  const [brushOpacity, setBrushOpacity] = useState(1.0);
-  const [brushType, setBrushType] = useState<'restore' | 'erase'>('restore');
-  const [originalImageElement, setOriginalImageElement] = useState<HTMLImageElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [isDrawing, setIsDrawing] = useState(false);
 
   // Pre-load original image for smooth brush performance
   useEffect(() => {
@@ -840,9 +898,11 @@ export default function App() {
                   <div className="space-y-1">
                     {[
                       { id: 'bg-remover', icon: Eraser, label: 'Background Remover', desc: 'Auto-remove image backgrounds' },
-                      { id: 'doc-assistant', icon: FileText, label: 'Document Assistant', desc: 'ID Scan, Signatures & PDF' },
+                      { id: 'doc-assistant', icon: Scan, label: 'Document Assistant', desc: 'ID Scan, Signatures & PDF' },
                       { id: 'compressor', icon: Minimize2, label: 'Photo Compressor', desc: 'Smart size reduction' },
                       { id: 'magic-retouch', icon: BrushIcon, label: 'Magic Retouch', desc: 'AI Object Eraser & Restore' },
+                      { id: 'crop-tool', icon: Maximize, label: 'Photo Crop', desc: '3:4, 16:9, Social Media Ready' },
+                      { id: 'smart-writer', icon: FilePlus, label: 'Resume Maker', desc: 'Resume & Letter Creator' },
                     ].map((tool) => (
                       <button
                         key={tool.id}
@@ -875,6 +935,13 @@ export default function App() {
                     >
                       <Fingerprint className="w-5 h-5 text-emerald-400" />
                       <span className="text-[10px] font-medium text-gray-400">Signature</span>
+                    </button>
+                    <button 
+                      onClick={() => { setCurrentTool('doc-assistant'); setDocMode('pdf'); setIsMenuOpen(false); }}
+                      className="p-3 rounded-xl bg-[#1A1A1A] border border-[#262626] flex flex-col items-center gap-2 hover:bg-[#222] transition-colors col-span-2"
+                    >
+                      <FilePlus className="w-5 h-5 text-blue-400" />
+                      <span className="text-[10px] font-medium text-gray-400">PDF Maker</span>
                     </button>
                   </div>
                 </div>
@@ -917,7 +984,7 @@ export default function App() {
           </div>
           <div className="flex bg-[#1A1A1A] rounded-xl border border-[#262626] p-1 gap-1">
             <button 
-              onClick={undo}
+              onClick={handleUndo}
               disabled={currentTool === 'magic-retouch' ? retouchUndoStack.length <= 1 : undoStack.length === 0}
               className="p-1.5 hover:bg-[#262626] rounded-lg transition-colors text-gray-500 hover:text-white disabled:opacity-20"
               title="Undo (Ctrl+Z)"
@@ -925,7 +992,7 @@ export default function App() {
               <Undo className="w-4 h-4" />
             </button>
             <button 
-              onClick={redo}
+              onClick={handleRedo}
               disabled={currentTool === 'magic-retouch' ? retouchRedoStack.length === 0 : redoStack.length === 0}
               className="p-1.5 hover:bg-[#262626] rounded-lg transition-colors text-gray-500 hover:text-white disabled:opacity-20"
               title="Redo (Ctrl+Y)"
@@ -1532,6 +1599,14 @@ export default function App() {
                             }}
                             className="pointer-events-none"
                           />
+                          {showOriginal && originalImageElement && (
+                            <img 
+                              src={retouchImage || ''} 
+                              className="absolute inset-0 w-full h-full object-contain pointer-events-none z-10 opacity-100 transition-opacity" 
+                              alt="Original"
+                              referrerPolicy="no-referrer"
+                            />
+                          )}
                           <canvas 
                             ref={maskCanvasRef}
                             onMouseDown={startDrawing}
@@ -1565,10 +1640,44 @@ export default function App() {
                             }}
                             className="cursor-crosshair touch-none"
                           />
+
+                          {/* Neural Scan Line Effect */}
+                          {isRetouching && (
+                            <motion.div 
+                              initial={{ top: '0%' }}
+                              animate={{ top: '100%' }}
+                              transition={{ duration: 1.2, repeat: Infinity, ease: "linear" }}
+                              className="absolute left-0 w-full h-[2px] bg-orange-500 shadow-[0_0_20px_#f97316] z-20 pointer-events-none"
+                            />
+                          )}
                         </div>
                         
+                        {/* Status Message Overlay */}
+                        <AnimatePresence>
+                          {showOriginal && (
+                            <motion.div 
+                              initial={{ opacity: 0, y: 10 }}
+                              animate={{ opacity: 1, y: 0 }}
+                              exit={{ opacity: 0 }}
+                              className="absolute top-6 left-1/2 -translate-x-1/2 px-4 py-2 bg-orange-600 rounded-full text-white text-[10px] font-bold tracking-widest uppercase shadow-2xl z-30"
+                            >
+                              Viewing Original
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
+
                         {/* Zoom Controls Overlay */}
                         <div className="absolute bottom-4 right-4 flex items-center gap-1">
+                          <button 
+                            onMouseDown={() => setShowOriginal(true)}
+                            onMouseUp={() => setShowOriginal(false)}
+                            onMouseLeave={() => setShowOriginal(false)}
+                            className="w-10 h-10 rounded-xl bg-black/80 border border-white/10 text-white flex items-center justify-center hover:bg-white hover:text-black transition-colors"
+                            title="Hold to see Original"
+                          >
+                            <Scan className="w-5 h-5" />
+                          </button>
+                          <div className="w-[1px] h-6 bg-white/10 mx-1" />
                           <button 
                             onClick={() => setRetouchZoom(prev => Math.min(10, prev + 0.5))}
                             className="w-10 h-10 rounded-xl bg-black/80 border border-white/10 text-white flex items-center justify-center hover:bg-orange-600 transition-colors"
@@ -1603,6 +1712,14 @@ export default function App() {
                       {/* Controls Area */}
                       <div className="w-full md:w-64 space-y-4">
                         <div className="bg-[#1A1A1A] border border-[#262626] p-4 rounded-2xl space-y-4 shadow-2xl">
+                          <button 
+                            onClick={autoFixImage}
+                            className="w-full h-12 bg-white/5 border border-white/10 hover:bg-orange-600/10 hover:border-orange-500/50 text-white rounded-xl flex items-center justify-center gap-3 transition-all mb-4"
+                          >
+                            <Zap className="w-4 h-4 text-orange-500" />
+                            <span className="text-[11px] font-bold tracking-tight">AI AUTO ENHANCE</span>
+                          </button>
+
                           <div className="flex items-center justify-between">
                             <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Brush Settings</span>
                             <div className="flex items-center gap-2">
@@ -1665,13 +1782,307 @@ export default function App() {
                         
                         <div className="p-4 bg-orange-500/5 border border-orange-500/10 rounded-2xl">
                           <p className="text-[10px] text-orange-500/70 font-medium leading-relaxed">
-                            <span className="font-bold">Tip:</span> Zoom in for tight corners. Use the "Hand" tool to move around the photo.
+                            <span className="font-bold">Pro Tip:</span> Use <span className="bg-orange-500/10 px-1 rounded">B</span> for Brush, <span className="bg-orange-500/10 px-1 rounded">H</span> for Hand, and <span className="bg-orange-500/10 px-1 rounded">[ ]</span> to change size.
                           </p>
                         </div>
                       </div>
                     </div>
                   </div>
                 )}
+              </div>
+            </motion.div>
+          )}
+
+          {currentTool === 'crop-tool' && (
+            <motion.div
+              key="crop-tool"
+              initial={{ opacity: 0, scale: 0.98 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 1.02 }}
+              transition={{ duration: 0.3 }}
+              className="w-full"
+            >
+              <div className="max-w-4xl mx-auto space-y-8">
+                <div className="flex flex-col gap-2 text-center items-center">
+                  <div className="w-16 h-16 rounded-2xl bg-blue-600/10 flex items-center justify-center">
+                    <Maximize className="w-8 h-8 text-blue-500" />
+                  </div>
+                  <h2 className="text-3xl font-bold tracking-tight text-white">Smart Photo Crop</h2>
+                  <p className="text-gray-500 text-sm max-w-lg">Optimize your photos for any platform with precision aspect ratios.</p>
+                </div>
+
+                {!cropImage ? (
+                  <div 
+                    onClick={() => {
+                      const input = document.createElement('input');
+                      input.type = 'file';
+                      input.accept = 'image/*';
+                      input.onchange = (e: any) => {
+                        const file = e.target.files[0];
+                        if (file) {
+                          const reader = new FileReader();
+                          reader.onload = (re) => setCropImage(re.target?.result as string);
+                          reader.readAsDataURL(file);
+                        }
+                      };
+                      input.click();
+                    }}
+                    className="w-full aspect-video rounded-3xl border-2 border-dashed border-[#262626] bg-[#111] flex flex-col items-center justify-center gap-4 cursor-pointer hover:border-blue-500/50 hover:bg-blue-500/5 transition-all group"
+                  >
+                    <Upload className="w-10 h-10 text-blue-500/50 group-hover:scale-110 transition-transform" />
+                    <div className="text-center">
+                      <p className="text-[#E5E7EB] font-bold">Upload Photo to Crop</p>
+                      <p className="text-[10px] text-gray-500 mt-1 uppercase tracking-widest">3:4, 16:9, Social Media Ready</p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-6">
+                    <div className="relative h-[400px] md:h-[600px] rounded-3xl overflow-hidden bg-[#0A0A0A] border border-[#262626]">
+                      <Cropper
+                        image={cropImage}
+                        crop={retouchPan}
+                        zoom={retouchZoom}
+                        aspect={cropRatio || undefined}
+                        onCropChange={setRetouchPan}
+                        onZoomChange={setRetouchZoom}
+                        onCropComplete={(_, croppedAreaPixels) => (window as any)._lastCropPixels = croppedAreaPixels}
+                      />
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-center gap-4">
+                      <button 
+                        onClick={() => setCropRatio(1)}
+                        className={`px-6 py-3 rounded-xl border font-bold text-xs transition-all ${cropRatio === 1 ? 'bg-blue-600 border-blue-500 text-white' : 'bg-[#1A1A1A] border-[#262626] text-gray-400'}`}
+                      >
+                        1:1 Square
+                      </button>
+                      <button 
+                        onClick={() => setCropRatio(4/5)}
+                        className={`px-6 py-3 rounded-xl border font-bold text-xs transition-all ${cropRatio === 4/5 ? 'bg-blue-600 border-blue-500 text-white' : 'bg-[#1A1A1A] border-[#262626] text-gray-400'}`}
+                      >
+                        4:5 Portrait
+                      </button>
+                      <button 
+                        onClick={() => setCropRatio(16/9)}
+                        className={`px-6 py-3 rounded-xl border font-bold text-xs transition-all ${cropRatio === 16/9 ? 'bg-blue-600 border-blue-500 text-white' : 'bg-[#1A1A1A] border-[#262626] text-gray-400'}`}
+                      >
+                        16:9 Cinema
+                      </button>
+                      <button 
+                        onClick={() => setCropRatio(null)}
+                        className={`px-6 py-3 rounded-xl border font-bold text-[10px] transition-all uppercase tracking-widest ${cropRatio === null ? 'bg-blue-600 border-blue-500 text-white shadow-lg shadow-blue-600/30' : 'bg-[#1A1A1A] border-[#262626] text-gray-400 hover:text-white'}`}
+                      >
+                        Manual Free-Form
+                      </button>
+                    </div>
+
+                    <div className="flex gap-4">
+                      <button 
+                        onClick={async () => {
+                          const pixels = (window as any)._lastCropPixels;
+                          if (!pixels || !cropImage) return;
+                          
+                          const canvas = document.createElement('canvas');
+                          const img = new Image();
+                          img.src = cropImage;
+                          await new Promise(r => img.onload = r);
+                          
+                          canvas.width = pixels.width;
+                          canvas.height = pixels.height;
+                          const ctx = canvas.getContext('2d');
+                          ctx?.drawImage(img, pixels.x, pixels.y, pixels.width, pixels.height, 0, 0, pixels.width, pixels.height);
+                          
+                          const url = canvas.toDataURL('image/jpeg', 0.9);
+                          setBatchItems(prev => [{
+                            id: Math.random().toString(36).substr(2, 9),
+                            name: 'Cropped Photo',
+                            original: cropImage,
+                            processed: url,
+                            status: 'done',
+                            progress: 100
+                          }, ...prev]);
+                          setCurrentTool('bg-remover');
+                          setCurrentIndex(0);
+                          setCropImage(null);
+                        }}
+                        className="flex-1 py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-2xl font-bold flex items-center justify-center gap-2 shadow-xl shadow-blue-600/20"
+                      >
+                        <CheckCircle2 className="w-5 h-5" />
+                        Complete Crop
+                      </button>
+                      <button 
+                        onClick={() => setCropImage(null)}
+                        className="px-8 py-4 bg-[#1A1A1A] border border-[#262626] text-gray-400 hover:text-white rounded-2xl font-bold"
+                      >
+                        Discard
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          )}
+
+          {currentTool === 'smart-writer' && (
+            <motion.div
+              key="smart-writer"
+              initial={{ opacity: 0, scale: 0.98 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 1.02 }}
+              transition={{ duration: 0.3 }}
+              className="w-full"
+            >
+              <div className="max-w-5xl mx-auto space-y-8 pb-32 px-4">
+                <div className="flex flex-col gap-2 text-center items-center">
+                  <div className="w-16 h-16 rounded-2xl bg-emerald-600/10 flex items-center justify-center">
+                    <FilePlus className="w-8 h-8 text-emerald-500" />
+                  </div>
+                  <h2 className="text-3xl font-bold tracking-tight text-white">Resume Maker</h2>
+                  <p className="text-gray-500 text-sm max-w-lg">Advanced document drafting with AI intelligence and professional layout.</p>
+                </div>
+
+                <div className="grid grid-cols-1 gap-8">
+                  {/* Prompt Section */}
+                  <div className="bg-[#1A1A1A] border border-[#262626] rounded-3xl p-6 space-y-6 shadow-2xl relative overflow-hidden group">
+                    <div className="absolute top-0 right-0 w-64 h-64 bg-emerald-600/5 rounded-full blur-3xl -translate-y-1/2 translate-x-1/2 group-hover:bg-emerald-600/10 transition-colors" />
+                    
+                    <div className="flex items-center justify-between relative z-10">
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 rounded-xl bg-emerald-600/20 flex items-center justify-center">
+                          <Zap className="w-5 h-5 text-emerald-500" />
+                        </div>
+                        <div>
+                          <h3 className="text-sm font-bold text-white uppercase tracking-widest">Document Intent</h3>
+                          <p className="text-[10px] text-gray-500">Provide details for the AI to draft</p>
+                        </div>
+                      </div>
+                      <div className="flex gap-2">
+                        <button 
+                          onClick={() => setWriterMode('resume')}
+                          className={`px-4 py-2 rounded-lg border text-[10px] font-bold transition-all ${writerMode === 'resume' ? 'bg-emerald-600 border-emerald-500 text-white' : 'bg-black/40 border-[#262626] text-gray-400'}`}
+                        >
+                          RESUME
+                        </button>
+                        <button 
+                          onClick={() => setWriterMode('letter')}
+                          className={`px-4 py-2 rounded-lg border text-[10px] font-bold transition-all ${writerMode === 'letter' ? 'bg-emerald-600 border-emerald-500 text-white' : 'bg-black/40 border-[#262626] text-gray-400'}`}
+                        >
+                          LETTER
+                        </button>
+                      </div>
+                    </div>
+
+                    <textarea 
+                      value={writerPrompt}
+                      onChange={(e) => setWriterPrompt(e.target.value)}
+                      placeholder={writerMode === 'resume' ? "E.g., B.Com student seeking finance internship, strong with Excel..." : "E.g., Formal resignation letter for software engineer position..."}
+                      className="w-full h-32 bg-black/40 border border-[#262626] rounded-2xl p-4 text-xs font-medium focus:border-emerald-500/50 outline-none transition-all resize-none placeholder:text-gray-700 relative z-10"
+                    />
+
+                    <button 
+                      onClick={async () => {
+                        if (!writerPrompt.trim()) return;
+                        setIsGeneratingWriter(true);
+                        setWriterContent("");
+                        try {
+                          const result = await ai.models.generateContent({
+                            model: "gemini-3-flash-preview",
+                            contents: `Generate a professional, visually clean ${writerMode} based on: "${writerPrompt}". Use Markdown for structure. No emojis unless requested, but use [•] for bullets and --- for lines. Include placeholders.`
+                          });
+                          setWriterContent(result.text || "");
+                        } catch (e) {
+                          console.error(e);
+                          setWriterContent("## Generation Failed\nPlease refine your prompt and try again.");
+                        } finally {
+                          setIsGeneratingWriter(false);
+                        }
+                      }}
+                      disabled={isGeneratingWriter || !writerPrompt.trim()}
+                      className="w-full py-4 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-800 disabled:text-gray-600 text-white rounded-2xl font-bold text-xs flex items-center justify-center gap-3 transition-all shadow-xl shadow-emerald-900/20 active:scale-[0.98] relative z-10"
+                    >
+                      {isGeneratingWriter ? <Loader2 className="w-5 h-5 animate-spin" /> : <Sparkles className="w-5 h-5" />}
+                      {isGeneratingWriter ? "DECODING INTENT..." : "CRAFT DOCUMENT WITH AI"}
+                    </button>
+                  </div>
+
+                  {/* Editor Section */}
+                  <div className="bg-[#0A0A0A] border border-[#262626] rounded-[2rem] overflow-hidden flex flex-col min-h-[700px] shadow-2xl relative">
+                    {/* Toolbar */}
+                    <div className="p-4 border-b border-[#262626] bg-[#111] flex flex-wrap items-center justify-between gap-4">
+                      <div className="flex items-center gap-2">
+                        <div className="px-4 py-2 bg-emerald-600/5 border border-emerald-500/10 rounded-xl">
+                          <span className="text-[10px] font-bold text-emerald-500 uppercase tracking-widest">Editor Active</span>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-4">
+                        <div className="hidden md:flex flex-col text-right">
+                          <span className="text-[9px] font-bold text-emerald-500 uppercase">Live Editor Mode</span>
+                          <span className="text-[8px] text-gray-500">Auto-Saving Enabled</span>
+                        </div>
+                        <button 
+                          onClick={() => {
+                            const doc = new jsPDF();
+                            doc.setFontSize(10);
+                            // Remove all markdown formatting for a clean PDF look
+                            const cleanText = writerContent
+                              .replace(/#{1,6}\s?/g, '') // Remove headings
+                              .replace(/\*\*/g, '')      // Remove bold
+                              .replace(/\*\*/g, '')        // Remove italic
+                              .replace(/`{1,3}/g, '')     // Remove code
+                              .replace(/\[\u2022\]/g, '•') // Replace bullet marker
+                              .replace(/---/g, '\n' + '_'.repeat(80) + '\n')
+                              .replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, '');
+                            
+                            const lines = doc.splitTextToSize(cleanText, 180);
+                            doc.text(lines, 15, 20);
+                            doc.save(`${writerMode}-pro.pdf`);
+                          }}
+                          className="h-10 px-6 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all shadow-lg shadow-emerald-900/30 flex items-center gap-2"
+                        >
+                          <Download className="w-4 h-4" />
+                          Finalize PDF
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Side-by-Side Editor & Preview */}
+                    <div className="flex-1 flex overflow-hidden">
+                      <div className="w-full md:w-1/2 flex flex-col border-r border-[#262626]">
+                        <div className="p-2 bg-[#111] border-b border-[#262626]">
+                          <span className="text-[8px] font-bold text-gray-600 uppercase ml-2 tracking-widest">Raw Document Source</span>
+                        </div>
+                        <textarea 
+                          id="writer-textarea"
+                          value={writerContent}
+                          onChange={(e) => setWriterContent(e.target.value)}
+                          placeholder="Craft your content here..."
+                          className="flex-1 w-full bg-black/20 p-8 text-xs font-mono leading-relaxed outline-none resize-none overflow-y-auto text-gray-400 focus:text-white transition-colors"
+                        />
+                      </div>
+                      
+                      <div className="hidden md:flex w-1/2 flex-col bg-[#111]/50 relative">
+                        <div className="p-2 bg-[#111] border-b border-[#262626]">
+                          <span className="text-[8px] font-bold text-emerald-500 uppercase ml-2 tracking-widest">Enhanced Live Preview</span>
+                        </div>
+                        <div className="flex-1 p-10 overflow-y-auto prose prose-invert prose-sm max-w-none shadow-inner bg-white/5 selection:bg-emerald-500/30">
+                          {isGeneratingWriter ? (
+                             <div className="flex flex-col items-center justify-center h-full gap-4 text-emerald-500/20">
+                               <Loader2 className="w-12 h-12 animate-spin" />
+                               <p className="text-[10px] font-bold uppercase tracking-widest animate-pulse">Engaging Resume Maker Engine...</p>
+                             </div>
+                          ) : (
+                            <div className="bg-white text-gray-900 p-12 min-h-full rounded-sm shadow-2xl relative overflow-hidden">
+                              <div className="prose prose-sm max-w-none prose-headings:text-gray-900 prose-p:text-gray-700 prose-li:text-gray-700 prose-hr:border-gray-200">
+                                <Markdown>{writerContent || "_Draft a new document to see the printable version here..._"}</Markdown>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
               </div>
             </motion.div>
           )}

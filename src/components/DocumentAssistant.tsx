@@ -21,15 +21,15 @@ interface DocumentAssistantProps {
 }
 
 export const DocumentAssistant: React.FC<DocumentAssistantProps> = ({ onSignatureExtract, initialTab = 'id-card' }) => {
-  const [activeTab, setActiveTab] = useState<'id-card' | 'signature' | 'pdf'>(initialTab);
+  const [activeTab, setActiveTab] = useState<'id-card' | 'signature' | 'pdf'>(initialTab as any);
 
   useEffect(() => {
-    setActiveTab(initialTab);
+    setActiveTab(initialTab as any);
   }, [initialTab]);
 
   const [idFront, setIdFront] = useState<string | null>(null);
   const [idBack, setIdBack] = useState<string | null>(null);
-  const [pdfFiles, setPdfFiles] = useState<File[]>([]);
+  const [pdfImages, setPdfImages] = useState<string[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
 
   const frontInputRef = useRef<HTMLInputElement>(null);
@@ -46,6 +46,22 @@ export const DocumentAssistant: React.FC<DocumentAssistantProps> = ({ onSignatur
     reader.readAsDataURL(file);
   };
 
+  const handlePdfUpload = (files: FileList) => {
+    const newImages: string[] = [];
+    let processed = 0;
+    Array.from(files).forEach(file => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        newImages.push(e.target?.result as string);
+        processed++;
+        if (processed === files.length) {
+          setPdfImages(prev => [...prev, ...newImages]);
+        }
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
   const generateIdPdf = async () => {
     if (!idFront || !idBack) return;
     setIsGenerating(true);
@@ -56,10 +72,9 @@ export const DocumentAssistant: React.FC<DocumentAssistantProps> = ({ onSignatur
       format: 'a4'
     });
 
-    // ID Card dimensions: ~85.6 x 54 mm
     const w = 85.6;
     const h = 54;
-    const x = (210 - w) / 2; // Center on A4 (210mm wide)
+    const x = (210 - w) / 2;
 
     pdf.addImage(idFront, 'JPEG', x, 20, w, h);
     pdf.addImage(idBack, 'JPEG', x, 20 + h + 10, w, h);
@@ -68,25 +83,20 @@ export const DocumentAssistant: React.FC<DocumentAssistantProps> = ({ onSignatur
     setIsGenerating(false);
   };
 
-  const generateMultiplePdf = async () => {
-    if (pdfFiles.length === 0) return;
+  const generateMergedPdf = async () => {
+    if (pdfImages.length === 0) return;
     setIsGenerating(true);
     
     const pdf = new jsPDF();
     
-    for (let i = 0; i < pdfFiles.length; i++) {
-      const file = pdfFiles[i];
-      const reader = new FileReader();
-      const imgData = await new Promise<string>((resolve) => {
-        reader.onload = (e) => resolve(e.target?.result as string);
-        reader.readAsDataURL(file);
-      });
-      
-      if (i > 0) pdf.addPage();
-      pdf.addImage(imgData, 'JPEG', 10, 10, 190, 277); // Approx full page with margins
-    }
-    
-    pdf.save('documents.pdf');
+    pdfImages.forEach((img, index) => {
+      if (index > 0) pdf.addPage();
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      pdf.addImage(img, 'JPEG', 0, 0, pageWidth, pageHeight);
+    });
+
+    pdf.save('merged_document.pdf');
     setIsGenerating(false);
   };
 
@@ -200,52 +210,64 @@ export const DocumentAssistant: React.FC<DocumentAssistantProps> = ({ onSignatur
         )}
 
         {activeTab === 'pdf' && (
-          <div className="space-y-8">
+          <div className="max-w-4xl mx-auto space-y-8">
             <div 
               onDragOver={(e) => e.preventDefault()}
-              onDrop={(e) => { e.preventDefault(); setPdfFiles(prev => [...prev, ...Array.from(e.dataTransfer.files)]); }}
-              className="w-full p-12 rounded-2xl border-2 border-dashed border-[#262626] bg-[#111] flex flex-col items-center justify-center gap-4 hover:border-blue-500/30 transition-all group"
+              onDrop={(e) => {
+                e.preventDefault();
+                if (e.dataTransfer.files) handlePdfUpload(e.dataTransfer.files);
+              }}
+              className="w-full min-h-[300px] rounded-3xl border-2 border-dashed border-[#262626] bg-[#0A0A0A] flex flex-col items-center justify-center p-12 text-center gap-6 group hover:border-blue-500/50 transition-all"
             >
-              <FilePlus className="w-12 h-12 text-blue-500/50 group-hover:scale-110 transition-transform" />
-              <div className="text-center">
-                <p className="font-semibold text-gray-300">Add photos to PDF</p>
-                <p className="text-[11px] text-gray-500 mt-1 uppercase tracking-widest">DRAG AND DROP OR CLICK TO UPLOAD</p>
+              <div className="w-20 h-20 rounded-2xl bg-blue-600/10 flex items-center justify-center group-hover:scale-110 transition-all">
+                <FilePlus className="w-10 h-10 text-blue-500" />
+              </div>
+              <div className="space-y-2">
+                <h3 className="text-2xl font-bold text-white">Add photos to PDF</h3>
+                <p className="text-gray-500 text-sm tracking-[0.1em] uppercase">DRAG AND DROP OR CLICK TO UPLOAD</p>
               </div>
               <button 
                 onClick={() => pdfInputRef.current?.click()}
-                className="mt-2 px-6 py-2 bg-[#222] border border-[#333] hover:bg-[#333] text-gray-300 rounded-lg text-sm font-medium transition-colors"
+                className="px-8 py-3 bg-[#1A1A1A] border border-[#262626] text-white rounded-xl font-bold hover:bg-[#222] transition-all"
               >
                 Select Files
               </button>
-              <input type="file" multiple className="hidden" ref={pdfInputRef} onChange={(e) => e.target.files && setPdfFiles(prev => [...prev, ...Array.from(e.target.files!)])} />
+              <input 
+                type="file" 
+                ref={pdfInputRef} 
+                className="hidden" 
+                multiple 
+                accept="image/*" 
+                onChange={(e) => e.target.files && handlePdfUpload(e.target.files)} 
+              />
             </div>
 
-            {pdfFiles.length > 0 && (
-              <div className="space-y-4 animate-in fade-in slide-in-from-top-4">
-                <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-bold uppercase tracking-widest text-[#555]">Selected Photos ({pdfFiles.length})</span>
-                  <button onClick={() => setPdfFiles([])} className="text-[10px] uppercase font-bold text-red-500 hover:text-red-400">Clear All</button>
-                </div>
-                <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 gap-4">
-                  {pdfFiles.map((file, i) => (
-                    <div key={i} className="relative aspect-square rounded-xl overflow-hidden bg-[#1A1A1A] border border-[#262626] group">
-                      <img src={URL.createObjectURL(file)} className="w-full h-full object-cover" />
-                      <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                        <button onClick={() => setPdfFiles(prev => prev.filter((_, idx) => idx !== i))}>
-                          <Trash2 className="w-5 h-5 text-red-500" />
-                        </button>
+            {pdfImages.length > 0 && (
+              <div className="space-y-6">
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
+                  {pdfImages.map((img, idx) => (
+                    <div key={idx} className="aspect-[3/4] rounded-xl overflow-hidden border border-[#262626] relative group">
+                      <img src={img} className="w-full h-full object-cover" />
+                      <button 
+                        onClick={() => setPdfImages(prev => prev.filter((_, i) => i !== idx))}
+                        className="absolute top-2 right-2 p-1.5 bg-red-600 text-white rounded-lg opacity-0 group-hover:opacity-100 transition-opacity"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                      <div className="absolute bottom-2 left-2 px-2 py-1 bg-black/60 rounded text-[10px] font-bold text-white">
+                        Page {idx + 1}
                       </div>
                     </div>
                   ))}
                 </div>
-                <div className="flex justify-center pt-8">
+                <div className="flex justify-center pt-4">
                   <button
                     disabled={isGenerating}
-                    onClick={generateMultiplePdf}
-                    className="px-10 py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-2xl font-bold flex items-center gap-3 transition-all active:scale-95 shadow-xl shadow-blue-600/20"
+                    onClick={generateMergedPdf}
+                    className="px-10 py-4 bg-blue-600 text-white hover:bg-blue-500 rounded-2xl font-bold flex items-center gap-3 transition-all shadow-xl shadow-blue-500/20"
                   >
-                    {isGenerating ? <Loader2 className="w-5 h-5 animate-spin" /> : <FileDigit className="w-5 h-5" />}
-                    Convert to PDF
+                    {isGenerating ? <Loader2 className="w-5 h-5 animate-spin" /> : <Download className="w-5 h-5" />}
+                    Generate Merged PDF ({pdfImages.length} Pages)
                   </button>
                 </div>
               </div>
@@ -256,3 +278,5 @@ export const DocumentAssistant: React.FC<DocumentAssistantProps> = ({ onSignatur
     </div>
   );
 };
+
+
